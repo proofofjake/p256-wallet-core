@@ -50,7 +50,7 @@ fn describe_call(
 
     if call.data.is_empty() {
         if call.value.is_zero() {
-            return ("Empty call".into(), vec![mono("To", target)]);
+            return ("Empty call".into(), vec![row("Call", "Empty (no data, no ETH)"), mono("To", target)]);
         }
         return ("Send ETH".into(), vec![row("Send", eth(call.value)), mono("To", target)]);
     }
@@ -183,6 +183,13 @@ mod tests {
         // Unknown token: raw units, never a guessed symbol.
         let details = describe(&op(&[Call { target: token, value: U256::ZERO, data }]), &[], &[]).unwrap();
         assert_eq!(details[0].value, "1234567 base units of an unknown token");
+    }
+
+    #[test]
+    fn empty_call_says_so() {
+        let details = describe(&op(&[Call { target: [0x55; 20], value: U256::ZERO, data: vec![] }]), &[], &[]).unwrap();
+        assert_eq!(details[0].value, "Empty (no data, no ETH)");
+        assert_eq!(details[1].label, "To");
     }
 
     #[test]
