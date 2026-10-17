@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml selects the compiler, components and targets; the first cargo call installs them.
+      - run: cargo --version
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --lib --features uniffi -- -D warnings
+      - run: cargo clippy --locked --lib --features wasm --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test --locked
+
+  live:
+    # Against Base Sepolia's public RPC. Kept separate so an RPC outage doesn't hide a real failure above.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked --test base_sepolia
+        env:
+          CORE_INTEGRATION: "1"
