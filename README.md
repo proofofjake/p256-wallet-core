@@ -122,3 +122,13 @@ The Swift build targets Apple Silicon (no x86_64 simulator slice).
 
 The core without bindings depends on about 30 crates, almost all from RustCrypto: run
 `cargo tree -e normal` to list them.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate by you,
+as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+`tests/data/erc6492-validator.hex` is the ERC-6492 reference validator bytecode as distributed in
+[viem](https://github.com/wevm/viem) (MIT), used only by the live tests.
