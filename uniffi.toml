@@ -1,0 +1,9 @@
+[bindings.swift]
+module_name = "P256WalletCore"
+ffi_module_name = "P256WalletCoreFFI"
+ffi_module_filename = "P256WalletCoreFFI"
+generate_module_map = true
+# CoreError gets a readable LocalizedError conformance in bindings/swift/Sources/P256WalletCore/CoreError.swift.
+omit_localized_error_conformance = true
+# Records encode as the same camelCase JSON the TypeScript binding uses; UserOperation is a bundler's JSON shape.
+generate_codable_conformance = true

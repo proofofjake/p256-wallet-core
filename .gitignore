@@ -1,0 +1,8 @@
+/target
+# Build outputs, regenerated from source by scripts/build-*.sh
+/bindings/swift/P256WalletCoreFFI.xcframework
+/bindings/swift/Sources/P256WalletCore/P256WalletCore.swift
+/bindings/swift/.build
+/bindings/ts/pkg
+/bindings/ts/node_modules
+.DS_Store

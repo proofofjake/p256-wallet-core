@@ -1,0 +1,15 @@
+{
+  "name": "@p256-wallet/core",
+  "version": "0.1.0",
+  "description": "P256 Wallet signing core for TypeScript (WebAssembly build of the Rust crate in this repo)",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "types": "./index.ts",
+  "scripts": {
+    "build": "../../scripts/build-wasm.sh",
+    "test": "node --test test.mjs"
+  }
+}
