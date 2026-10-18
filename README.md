@@ -39,7 +39,7 @@ so every output can be checked against a fixed expected value.
 | The review names the sending wallet and network and lists every call: ETH and token amounts (raw units for unknown tokens, never a guessed symbol), approvals (2^128 and up read as unlimited), owner changes with the full key, and function names marked unverified (shown only when one supplied signature matches the selector). | `review::describe` |
 | The review names any paymaster. Only paymasters on the chain's reviewed list are called sponsors; any other is flagged as able to charge the wallet's tokens. | `review::describe`, `ChainConfig::known_paymasters` |
 | Review text can't fake lines or reorder characters: control, bidi and invisible characters are shown as escapes, and long values are cut. | `review::sanitize` |
-| A wallet record whose owners don't produce its address is rejected before anything is built or signed. | `api::build_user_operation`, `api::sign_message` |
+| A wallet record whose owners don't produce its address is rejected before anything is built or signed, and a record restored from a backup file is checked the same way (plus valid, unique keys) before an app accepts it. | `api::build_user_operation`, `api::sign_message`, `api::check_wallet_record` |
 | Registered public keys must be valid curve points, from the credential that was just created, under the expected relying party. Duplicate CBOR map keys are refused. | `webauthn::register`, `cbor` |
 | Amounts are parsed exactly (no rounding, overflow is an error, and an ambiguous comma like "1,000" is refused), and display formatting never rounds up. | `units` |
 

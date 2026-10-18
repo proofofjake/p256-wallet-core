@@ -114,6 +114,11 @@ pub fn account_address(initial_owners: Vec<String>) -> Result<String, JsError> {
     string(api::account_address(initial_owners))
 }
 
+#[wasm_bindgen(js_name = checkWalletRecord)]
+pub fn check_wallet_record(address: String, initial_owners: Vec<String>, keys: JsValue) -> Result<String, JsError> {
+    string(api::check_wallet_record(address, initial_owners, from_js(keys, "keys")?))
+}
+
 #[wasm_bindgen(js_name = transferCall)]
 pub fn transfer_call(token: Option<String>, to: String, amount: String) -> Result<JsValue, JsError> {
     to_js(api::transfer_call(token, to, amount))

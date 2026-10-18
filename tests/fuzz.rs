@@ -312,6 +312,8 @@ fn gas_and_keys_never_panic() {
             rp_id: random_text(rng),
             require_user_verification: rng.chance(2),
         };
+        let _ = api::check_wallet_record(random_text(rng), owners.clone(), vec![fake.clone()]);
+        let _ = api::check_wallet_record(wallet.address.clone(), wallet.owners.clone(), vec![fake.clone()]);
         let assertion = wallet.keys[0].assert(&rng.bytes(32), rng.next() as u8);
         let _ = api::sign_user_operation(op.clone(), rng.next(), assertion.clone(), vec![fake.clone()], owners.clone());
         let _ = api::sign_message(

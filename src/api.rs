@@ -287,6 +287,44 @@ pub fn account_address(initial_owners: Vec<String>) -> Result<String> {
     Ok(address::checksum(&wallet::account_address(&owners(&initial_owners)?, U256::ZERO)))
 }
 
+/// Checks a wallet record restored from a backup file before an app trusts it, and returns its checksummed address.
+/// The initial owners must produce `address`, there must be at least one key, every key must be a valid P-256 key
+/// with a relying party ID, credential IDs must be unique, and a key claiming an initial owner's index must be that
+/// owner. Signing re-checks all of this; checking here turns a damaged or edited file into a clear error up front.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn check_wallet_record(address: String, initial_owners: Vec<String>, keys: Vec<OwnerKey>) -> Result<String> {
+    let damaged =
+        |detail: &str| invalid(format!("This backup file can't be used: {detail}. It may be damaged or edited."));
+    let account = addr(&address).map_err(|_| damaged("its wallet address isn't valid"))?;
+    let owners = owners(&initial_owners).map_err(|_| damaged("its owner list isn't valid"))?;
+    if wallet::account_address(&owners, U256::ZERO) != account {
+        return Err(damaged("its owner keys don't produce its wallet address"));
+    }
+    if keys.is_empty() {
+        return Err(damaged("it has no keys"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (position, key) in keys.iter().enumerate() {
+        let number = position + 1;
+        let public_key =
+            public_key(&key.public_key).map_err(|_| damaged(&format!("key {number}'s public key isn't valid")))?;
+        let credential =
+            bytes(&key.credential_id).map_err(|_| damaged(&format!("key {number}'s credential ID isn't valid")))?;
+        if credential.is_empty() || !seen.insert(credential) {
+            return Err(damaged(&format!("key {number}'s credential ID is missing or repeated")));
+        }
+        if key.rp_id.is_empty() {
+            return Err(damaged(&format!("key {number} has no relying party ID")));
+        }
+        if let Some(recorded) = owners.get(key.owner_index as usize) {
+            if recorded[..] != public_key.owner_bytes()[..] {
+                return Err(damaged(&format!("key {number} doesn't match owner #{} of the wallet", key.owner_index)));
+            }
+        }
+    }
+    Ok(address::checksum(&account))
+}
+
 // MARK: Calls
 
 /// Sends `amount` of ETH (`token` = nil) or of the ERC-20 at `token`.
@@ -670,6 +708,53 @@ mod tests {
     }
 
     const DEAD_ADDRESS: &str = "0x000000000000000000000000000000000000dEaD";
+
+    #[test]
+    fn wallet_records_from_backups() {
+        let wallet = wallet(&[1, 2]);
+        let lowercase = wallet.address.to_lowercase();
+        assert_eq!(check_wallet_record(lowercase, wallet.owners.clone(), wallet.keys.clone()).unwrap(), wallet.address);
+
+        let other = self::wallet(&[3]);
+        let refused = [
+            ("other owners", check_wallet_record(wallet.address.clone(), other.owners.clone(), wallet.keys.clone())),
+            ("no keys", check_wallet_record(wallet.address.clone(), wallet.owners.clone(), vec![])),
+            (
+                "swapped keys",
+                check_wallet_record(
+                    wallet.address.clone(),
+                    wallet.owners.clone(),
+                    vec![OwnerKey { owner_index: 1, ..wallet.keys[0].clone() }],
+                ),
+            ),
+            (
+                "repeated credential",
+                check_wallet_record(
+                    wallet.address.clone(),
+                    wallet.owners.clone(),
+                    vec![wallet.keys[0].clone(), OwnerKey { owner_index: 5, ..wallet.keys[0].clone() }],
+                ),
+            ),
+            (
+                "no relying party",
+                check_wallet_record(
+                    wallet.address.clone(),
+                    wallet.owners.clone(),
+                    vec![OwnerKey { rp_id: String::new(), ..wallet.keys[0].clone() }],
+                ),
+            ),
+            ("bad address", check_wallet_record("0x1234".into(), wallet.owners.clone(), wallet.keys.clone())),
+        ];
+        for (case, result) in refused {
+            let message = result.expect_err(case).to_string();
+            assert!(message.starts_with("This backup file can't be used"), "{case}: {message}");
+        }
+        // A key added after setup (index past the initial owners) is accepted.
+        let added = OwnerKey { owner_index: 2, ..other.keys[0].clone() };
+        let mut keys = wallet.keys.clone();
+        keys.push(added);
+        assert!(check_wallet_record(wallet.address.clone(), wallet.owners.clone(), keys).is_ok());
+    }
 
     #[test]
     fn values() {

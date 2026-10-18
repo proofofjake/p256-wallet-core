@@ -179,6 +179,9 @@ export const verifyRegistration = (
 ): Registration => wasm.verifyRegistration(attestationObject, credentialId, rpId, requireUserVerification)
 export const ownerBytes = (key: PublicKey): Hex => wasm.ownerBytes(key) as Hex
 export const accountAddress = (initialOwners: Hex[]): Address => wasm.accountAddress(initialOwners) as Address
+/** Checks a wallet record restored from a backup file; returns its checksummed address or throws a readable error. */
+export const checkWalletRecord = (address: string, initialOwners: Hex[], keys: OwnerKey[]): Address =>
+  wasm.checkWalletRecord(address, initialOwners, keys) as Address
 
 // Calls
 export const transferCall = (token: Address | undefined, to: string, amount: Quantity): Call =>

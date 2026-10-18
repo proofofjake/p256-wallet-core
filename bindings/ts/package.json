@@ -1,6 +1,6 @@
 {
   "name": "@p256-wallet/core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "P256 Wallet signing core for TypeScript (WebAssembly build of the Rust crate in this repo)",
   "license": "MIT OR Apache-2.0",
   "private": true,
