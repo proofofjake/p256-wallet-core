@@ -80,6 +80,29 @@ record! {
         pub credential_id: String,
         pub owner_index: u32,
         pub public_key: PublicKey,
+        /// The WebAuthn relying party ID the key was registered under. Assertions for any other are refused.
+        pub rp_id: String,
+        /// The owner chose to protect this key with its PIN; assertions without user verification are refused.
+        pub require_user_verification: bool,
+    }
+}
+
+record! {
+    /// A security key registration, checked by `verify_registration`.
+    pub struct Registration {
+        pub public_key: PublicKey,
+        /// The key verified its PIN (or biometric) while registering.
+        pub user_verified: bool,
+        /// The key itself will refuse to sign without its PIN (`credProtect` level 3), whatever an app asks for.
+        pub pin_enforced_by_key: bool,
+    }
+}
+
+record! {
+    /// A contract the core recognizes by address, such as a gas sponsor.
+    pub struct KnownContract {
+        pub address: String,
+        pub name: String,
     }
 }
 
@@ -109,6 +132,9 @@ record! {
         /// Verification gas added to the bundler's estimate (see `apply_gas_estimate`). Chains without the
         /// RIP-7212 precompile need far more.
         pub verification_gas_buffer: u64,
+        /// Paymasters reviewed as pure sponsors: they pay gas and charge the wallet nothing. Any other paymaster is
+        /// named in the review with a warning, because it may charge the wallet's tokens.
+        pub known_paymasters: Vec<KnownContract>,
     }
 }
 
@@ -142,9 +168,12 @@ record! {
         pub details: Vec<ReviewDetail>,
         /// Whether this operation deploys the account (its first transaction).
         pub deploys_account: bool,
-        /// Whether a paymaster pays the gas.
+        /// The paymaster, if one pays the gas. The review's details name it too.
+        pub paymaster: Option<String>,
+        /// The paymaster is a known sponsor (see `ChainConfig::known_paymasters`) that charges the wallet nothing.
         pub sponsored: bool,
-        /// Most the account can pay in gas, in wei. Zero when sponsored. The actual cost is usually far lower.
+        /// Most the account can pay in gas, in wei. Zero when a paymaster pays (though an unknown paymaster may
+        /// charge tokens instead; the details say so). The actual cost is usually far lower.
         pub max_gas_cost: String,
         /// ETH sent by the calls, in wei.
         pub total_value: String,

@@ -92,7 +92,15 @@ fn assertion(assertion: &Assertion) -> Result<webauthn::Assertion> {
 }
 
 /// Finds the owner that produced `assertion` and returns its `SignatureWrapper` over `challenge`.
-fn wrapped_signature(assertion_record: &Assertion, challenge: &[u8], owner_keys: &[OwnerKey]) -> Result<Vec<u8>> {
+///
+/// The owner's index is checked against the wallet record where the record fixes it (the initial owners), so a
+/// mismatched key list fails here rather than as an opaque onchain rejection.
+fn wrapped_signature(
+    assertion_record: &Assertion,
+    challenge: &[u8],
+    owner_keys: &[OwnerKey],
+    initial_owners: &[Vec<u8>],
+) -> Result<Vec<u8>> {
     if owner_keys.is_empty() {
         return Err(bad_assertion("This wallet has no keys that can sign on this network"));
     }
@@ -101,14 +109,46 @@ fn wrapped_signature(assertion_record: &Assertion, challenge: &[u8], owner_keys:
         .iter()
         .find(|owner| hex::decode(&owner.credential_id).ok().as_deref() == Some(&assertion.credential_id[..]))
         .ok_or_else(|| bad_assertion("That key isn't an owner of this wallet"))?;
-    let data = webauthn::signature_data(&assertion, challenge, &public_key(&owner.public_key)?)?;
+    let key = public_key(&owner.public_key)?;
+    if let Some(recorded) = initial_owners.get(owner.owner_index as usize) {
+        if recorded[..] != key.owner_bytes()[..] {
+            return Err(bad_assertion(format!(
+                "This key isn't owner #{} in the wallet record; the key list is out of date",
+                owner.owner_index
+            )));
+        }
+    }
+    if owner.rp_id.is_empty() {
+        return Err(invalid("Owner key has no relying party ID"));
+    }
+    let expected = webauthn::ExpectedKey {
+        public_key: key,
+        rp_id: owner.rp_id.clone(),
+        require_user_verification: owner.require_user_verification,
+    };
+    let data = webauthn::signature_data(&assertion, challenge, &expected)?;
     Ok(wallet::wrap_signature(owner.owner_index, data))
 }
 
-/// Refuses operations the core can't fully account for: an account call other than `execute`/`executeBatch`, or a
-/// deployment that wouldn't create `sender`.
+/// The wallet record's initial owners, checked to produce `account`.
+fn record_owners(initial_owners: &[String], account: [u8; 20]) -> Result<Vec<Vec<u8>>> {
+    let owners = owners(initial_owners)?;
+    if wallet::account_address(&owners, U256::ZERO) != account {
+        return Err(invalid("Wallet address doesn't match its owner keys"));
+    }
+    Ok(owners)
+}
+
+/// Refuses operations the core can't fully account for: an account call other than `execute`/`executeBatch`, a
+/// call to the wallet itself outside the owner changes it supports, a malformed paymaster, or a deployment that
+/// wouldn't create `sender`.
 fn check_operation(op: &Op) -> Result<()> {
-    wallet::decode_call_data(&op.call_data)?;
+    for call in wallet::decode_call_data(&op.call_data)? {
+        if call.target == op.sender && !call.data.is_empty() {
+            wallet::classify_self_call(&call.data)?;
+        }
+    }
+    review::paymaster(op)?;
     if !op.init_code.is_empty() {
         let (owners, nonce) = wallet::decode_init_code(&op.init_code)?;
         if wallet::account_address(&owners, nonce) != op.sender {
@@ -204,19 +244,35 @@ pub fn decode_revert_reason(data: String) -> Option<String> {
     abi::decode_revert_reason(&bytes(&data).ok()?)
 }
 
-/// Whether an `isValidSignature` result is the ERC-1271 success value.
+/// Whether an `isValidSignature` result is exactly the ERC-1271 success value: one word, the magic value followed by
+/// zero padding.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn is_erc1271_success(result: String) -> bool {
-    bytes(&result).map(|b| b.get(..4) == Some(&wallet::ERC1271_MAGIC_VALUE[..])).unwrap_or(false)
+    bytes(&result)
+        .map(|b| b.len() == 32 && b[..4] == wallet::ERC1271_MAGIC_VALUE && b[4..].iter().all(|&x| x == 0))
+        .unwrap_or(false)
 }
 
 // MARK: Keys and accounts
 
-/// The public key from a security key registration, checked to belong to `credential_id` and to be on the curve.
+/// Checks a security key registration and returns its public key. Refuses a response for another credential or
+/// relying party, a synced passkey (only hardware keys can be owners), and, when the user chose a PIN for this key
+/// (`require_user_verification`), a response without PIN verification. Store `require_user_verification` with the
+/// key and pass it back in `OwnerKey`.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
-pub fn public_key_from_attestation_object(attestation_object: String, credential_id: String) -> Result<PublicKey> {
-    let key = webauthn::public_key_from_attestation_object(&bytes(&attestation_object)?, &bytes(&credential_id)?)?;
-    Ok(public_key_record(&key))
+pub fn verify_registration(
+    attestation_object: String,
+    credential_id: String,
+    rp_id: String,
+    require_user_verification: bool,
+) -> Result<Registration> {
+    let registration =
+        webauthn::register(&bytes(&attestation_object)?, &bytes(&credential_id)?, &rp_id, require_user_verification)?;
+    Ok(Registration {
+        public_key: public_key_record(&registration.public_key),
+        user_verified: registration.user_verified,
+        pin_enforced_by_key: registration.pin_enforced_by_key,
+    })
 }
 
 /// The 64-byte owner entry for a P-256 key.
@@ -269,10 +325,7 @@ pub fn build_user_operation(
     signing_owner_index: u32,
 ) -> Result<UserOperation> {
     let sender = addr(&sender)?;
-    let owners = owners(&initial_owners)?;
-    if wallet::account_address(&owners, U256::ZERO) != sender {
-        return Err(invalid("Wallet address doesn't match its owner keys"));
-    }
+    let owners = record_owners(&initial_owners, sender)?;
     let calls = calls.iter().map(call).collect::<Result<Vec<_>>>()?;
     Ok(op_record(&Op {
         sender,
@@ -329,13 +382,20 @@ pub fn review_user_operation(
         .iter()
         .try_fold(U256::ZERO, |sum, call| sum.checked_add(call.value))
         .ok_or_else(|| invalid("Total value is too large"))?;
-    let sponsored = !op.paymaster_and_data.is_empty();
-    let max_gas_cost = if sponsored { U256::ZERO } else { op.max_cost()? };
+    let known_paymasters =
+        chains::all().into_iter().find(|c| c.id == chain_id).map(|c| c.known_paymasters).unwrap_or_default();
+    let paymaster = review::paymaster(&op)?;
+    // With any paymaster, the EntryPoint charges gas to the paymaster's deposit, not the wallet's ETH. Whether it
+    // charges the wallet some other way is what `sponsored` and the review's paymaster lines are about.
+    let max_gas_cost = if paymaster.is_some() { U256::ZERO } else { op.max_cost()? };
+    let sponsored =
+        paymaster.is_some_and(|p| known_paymasters.iter().any(|k| address::parse(&k.address).ok() == Some(p)));
     let required_balance = max_gas_cost.checked_add(total_value).ok_or_else(|| invalid("Total cost is too large"))?;
     Ok(OperationReview {
         hash: hex::encode(&op.hash(chain_id)),
-        details: review::describe(&op, &tokens, &function_signatures)?,
+        details: review::describe(&op, chain_id, &tokens, &function_signatures, &known_paymasters)?,
         deploys_account: !op.init_code.is_empty(),
+        paymaster: paymaster.map(|p| address::checksum(&p)),
         sponsored,
         max_gas_cost: hex::quantity(max_gas_cost),
         total_value: hex::quantity(total_value),
@@ -350,17 +410,20 @@ pub fn user_operation_hash(op: UserOperation, chain_id: u64) -> Result<String> {
 }
 
 /// Attaches a security key's signature to `op`. Recomputes the hash from `op`, checks the assertion signed exactly
-/// that with one of `owners`, and that `op` is one the core can describe; then returns `op` with its signature.
+/// that with one of `owners` (matching the wallet record's `initial_owners`), and that `op` is one the core can
+/// describe; then returns `op` with its signature.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn sign_user_operation(
     op: UserOperation,
     chain_id: u64,
     assertion: Assertion,
     owners: Vec<OwnerKey>,
+    initial_owners: Vec<String>,
 ) -> Result<UserOperation> {
     let mut op = self::op(&op)?;
     check_operation(&op)?;
-    op.signature = wrapped_signature(&assertion, &op.hash(chain_id), &owners)?;
+    let initial = record_owners(&initial_owners, op.sender)?;
+    op.signature = wrapped_signature(&assertion, &op.hash(chain_id), &owners, &initial)?;
     Ok(op_record(&op))
 }
 
@@ -389,13 +452,10 @@ pub fn sign_message(
     initial_owners: Vec<String>,
 ) -> Result<SignedMessage> {
     let account_bytes = addr(&account)?;
-    let initial = self::owners(&initial_owners)?;
-    if wallet::account_address(&initial, U256::ZERO) != account_bytes {
-        return Err(invalid("Wallet address doesn't match its owner keys"));
-    }
+    let initial = record_owners(&initial_owners, account_bytes)?;
     let message_hash = wallet::personal_message_hash(message.as_bytes());
     let challenge = wallet::replay_safe_hash(message_hash, account_bytes, chain_id);
-    let signature = wrapped_signature(&assertion, &challenge, &owners)?;
+    let signature = wrapped_signature(&assertion, &challenge, &owners, &initial)?;
     let signature = if deployed { signature } else { wallet::erc6492_wrap(signature, &initial, U256::ZERO) };
     Ok(SignedMessage { message_hash: hex::encode(&message_hash), signature: hex::encode(&signature) })
 }
@@ -431,6 +491,8 @@ mod tests {
                     credential_id: hex::encode(&assert_with(&signing, &[0; 32], FLAG_USER_PRESENT).credential_id),
                     owner_index: index as u32,
                     public_key: public_key_record(&key_of(&signing)),
+                    rp_id: "p256wallet.dev".into(),
+                    require_user_verification: false,
                 }
             })
             .collect();
@@ -461,7 +523,7 @@ mod tests {
         let op = apply_gas_estimate(op, estimate, 30_000).unwrap();
         let review = review_user_operation(op.clone(), 84532, vec![], vec![]).unwrap();
         assert!(review.deploys_account && !review.sponsored);
-        assert_eq!(review.details[0].value, "0.000000000000000001 ETH");
+        assert_eq!(review.details[2].value, "0.000000000000000001 ETH");
         assert_eq!(
             compare_quantities(review.required_balance.clone(), review.max_gas_cost.clone()).unwrap(),
             1,
@@ -471,19 +533,24 @@ mod tests {
         // The backup key (index 1) signs.
         let challenge = hex::decode(&review.hash).unwrap();
         let assertion = assertion_record(&assert_with(&test_key(2), &challenge, FLAG_USER_PRESENT));
-        let signed = sign_user_operation(op.clone(), 84532, assertion.clone(), wallet.keys.clone()).unwrap();
+        let signed =
+            sign_user_operation(op.clone(), 84532, assertion.clone(), wallet.keys.clone(), wallet.owners.clone())
+                .unwrap();
         let wrapper = hex::decode(&signed.signature).unwrap();
         let decoder = abi::Decoder::new(&wrapper);
         assert_eq!(decoder.usize(decoder.usize(0).unwrap()).unwrap(), 1, "owner index of the backup key");
 
         // Same assertion against another chain's hash, or a changed operation, is refused.
-        assert!(sign_user_operation(op.clone(), 8453, assertion.clone(), wallet.keys.clone()).is_err());
+        assert!(sign_user_operation(op.clone(), 8453, assertion.clone(), wallet.keys.clone(), wallet.owners.clone())
+            .is_err());
         let mut changed = op.clone();
         changed.max_fee_per_gas = "0x1".into();
-        assert!(sign_user_operation(changed, 84532, assertion.clone(), wallet.keys.clone()).is_err());
+        assert!(
+            sign_user_operation(changed, 84532, assertion.clone(), wallet.keys.clone(), wallet.owners.clone()).is_err()
+        );
         // A key that isn't an owner is refused even if its signature is valid.
         let stranger = assertion_record(&assert_with(&test_key(9), &challenge, FLAG_USER_PRESENT));
-        assert!(sign_user_operation(op, 84532, stranger, wallet.keys).is_err());
+        assert!(sign_user_operation(op, 84532, stranger, wallet.keys, wallet.owners).is_err());
     }
 
     #[test]
@@ -504,7 +571,7 @@ mod tests {
         assert!(review_user_operation(op.clone(), 84532, vec![], vec![]).is_err());
         let challenge = hex::decode(&user_operation_hash(op.clone(), 84532).unwrap()).unwrap();
         let assertion = assertion_record(&assert_with(&test_key(1), &challenge, FLAG_USER_PRESENT));
-        assert!(sign_user_operation(op, 84532, assertion, wallet.keys).is_err());
+        assert!(sign_user_operation(op, 84532, assertion, wallet.keys, wallet.owners).is_err());
     }
 
     #[test]
@@ -542,6 +609,69 @@ mod tests {
     }
 
     #[test]
+    fn owner_keys_must_match_the_wallet_record() {
+        let wallet = wallet(&[1, 2]);
+        let op = send_eth(&wallet);
+        let challenge = hex::decode(&user_operation_hash(op.clone(), 84532).unwrap()).unwrap();
+        let assertion = assertion_record(&assert_with(&test_key(2), &challenge, FLAG_USER_PRESENT));
+        // Key 2 claims index 0, which the record gives to key 1.
+        let swapped = vec![OwnerKey { owner_index: 0, ..wallet.keys[1].clone() }];
+        assert!(sign_user_operation(op.clone(), 84532, assertion.clone(), swapped, wallet.owners.clone()).is_err());
+        // Owners that don't produce the sender are refused too.
+        let other = self::wallet(&[3]);
+        assert!(sign_user_operation(op, 84532, assertion, wallet.keys, other.owners).is_err());
+    }
+
+    #[test]
+    fn per_key_pin_and_relying_party() {
+        let wallet = wallet(&[1]);
+        let op = send_eth(&wallet);
+        let challenge = hex::decode(&user_operation_hash(op.clone(), 84532).unwrap()).unwrap();
+        let touch = assertion_record(&assert_with(&test_key(1), &challenge, FLAG_USER_PRESENT));
+        let pin = assertion_record(&assert_with(&test_key(1), &challenge, FLAG_USER_PRESENT | 0x04));
+        let with_pin = vec![OwnerKey { require_user_verification: true, ..wallet.keys[0].clone() }];
+        assert!(sign_user_operation(op.clone(), 84532, touch.clone(), with_pin.clone(), wallet.owners.clone()).is_err());
+        assert!(sign_user_operation(op.clone(), 84532, pin, with_pin, wallet.owners.clone()).is_ok());
+        let other_rp = vec![OwnerKey { rp_id: "fblccdigbmoojajgljjbpaihhdjdcghn".into(), ..wallet.keys[0].clone() }];
+        assert!(sign_user_operation(op, 84532, touch, other_rp, wallet.owners).is_err());
+    }
+
+    #[test]
+    fn refuses_self_calls_outside_the_allowlist() {
+        let wallet = wallet(&[1]);
+        let takeover = encode_function_call("addOwnerAddress(address)".into(), vec![DEAD_ADDRESS.into()]).unwrap();
+        let call = Call { target: wallet.address.clone(), value: "0x0".into(), data: takeover.data };
+        let op = build_user_operation(
+            wallet.address.clone(),
+            "0x0".into(),
+            true,
+            wallet.owners.clone(),
+            vec![call],
+            gas(),
+            0,
+        )
+        .unwrap();
+        assert!(review_user_operation(op.clone(), 84532, vec![], vec![]).is_err());
+        let challenge = hex::decode(&user_operation_hash(op.clone(), 84532).unwrap()).unwrap();
+        let assertion = assertion_record(&assert_with(&test_key(1), &challenge, FLAG_USER_PRESENT));
+        assert!(sign_user_operation(op, 84532, assertion, wallet.keys, wallet.owners).is_err());
+    }
+
+    #[test]
+    fn unknown_paymasters_are_named_not_called_sponsored() {
+        let wallet = wallet(&[1]);
+        let mut op = send_eth(&wallet);
+        op.paymaster_and_data = format!("0x{}{}", "77".repeat(20), "ab".repeat(8));
+        let review = review_user_operation(op, 84532, vec![], vec![]).unwrap();
+        assert_eq!(review.paymaster.as_deref(), Some(address::checksum(&[0x77; 20]).as_str()));
+        assert!(!review.sponsored);
+        assert_eq!(review.max_gas_cost, "0x0", "the paymaster's deposit pays the gas, not the wallet's ETH");
+        assert!(review.details.iter().any(|d| d.value.contains("Not a known sponsor")));
+    }
+
+    const DEAD_ADDRESS: &str = "0x000000000000000000000000000000000000dEaD";
+
+    #[test]
     fn values() {
         assert_eq!(parse_units("1.5".into(), 6).unwrap(), "0x16e360");
         assert_eq!(format_units("0x16e360".into(), 6, 6).unwrap(), "1.5");
@@ -553,6 +683,8 @@ mod tests {
         );
         assert!(is_erc1271_success(format!("0x1626ba7e{}", "0".repeat(56))));
         assert!(!is_erc1271_success("0xffffffff".into()));
+        assert!(!is_erc1271_success(format!("0x1626ba7e{}01", "0".repeat(54))), "non-zero padding");
+        assert!(!is_erc1271_success(format!("0x1626ba7e{}", "0".repeat(120))), "more than one word");
         assert_eq!(fallback_gas_price("0x10".into(), "0x1".into()).unwrap().max_fee_per_gas, "0x21");
         let token = transfer_call(
             Some("0x036CbD53842c5426634e7929541eC2318f3dCF7e".into()),

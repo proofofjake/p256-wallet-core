@@ -63,6 +63,23 @@ export interface OwnerKey {
   credentialId: Hex
   ownerIndex: number
   publicKey: PublicKey
+  /** The WebAuthn relying party ID the key was registered under. */
+  rpId: string
+  /** The owner chose to protect this key with its PIN. */
+  requireUserVerification: boolean
+}
+
+/** A security key registration, checked by `verifyRegistration`. */
+export interface Registration {
+  publicKey: PublicKey
+  userVerified: boolean
+  /** The key itself refuses to sign without its PIN (`credProtect` level 3). */
+  pinEnforcedByKey: boolean
+}
+
+export interface KnownContract {
+  address: Address
+  name: string
 }
 
 export interface Token {
@@ -82,6 +99,8 @@ export interface ChainConfig {
   blockscoutUrl?: string
   knownTokens: Token[]
   verificationGasBuffer: number
+  /** Paymasters reviewed as pure sponsors. Any other paymaster is flagged in the review. */
+  knownPaymasters: KnownContract[]
 }
 
 export interface EncodedFunctionCall {
@@ -102,6 +121,9 @@ export interface OperationReview {
   hash: Hex
   details: ReviewDetail[]
   deploysAccount: boolean
+  /** The paymaster, if one pays the gas. */
+  paymaster?: Address
+  /** The paymaster is a known sponsor that charges the wallet nothing. */
   sponsored: boolean
   maxGasCost: Quantity
   totalValue: Quantity
@@ -149,8 +171,12 @@ export const decodeRevertReason = (data: string): string | undefined => wasm.dec
 export const isErc1271Success = (result: string): boolean => wasm.isErc1271Success(result)
 
 // Keys and accounts
-export const publicKeyFromAttestationObject = (attestationObject: Hex, credentialId: Hex): PublicKey =>
-  wasm.publicKeyFromAttestationObject(attestationObject, credentialId)
+export const verifyRegistration = (
+  attestationObject: Hex,
+  credentialId: Hex,
+  rpId: string,
+  requireUserVerification: boolean,
+): Registration => wasm.verifyRegistration(attestationObject, credentialId, rpId, requireUserVerification)
 export const ownerBytes = (key: PublicKey): Hex => wasm.ownerBytes(key) as Hex
 export const accountAddress = (initialOwners: Hex[]): Address => wasm.accountAddress(initialOwners) as Address
 
@@ -180,8 +206,13 @@ export const reviewUserOperation = (
   functionSignatures: string[] = [],
 ): OperationReview => wasm.reviewUserOperation(op, chainId, tokens, functionSignatures)
 export const userOperationHash = (op: UserOperation, chainId: number): Hex => wasm.userOperationHash(op, chainId) as Hex
-export const signUserOperation = (op: UserOperation, chainId: number, assertion: Assertion, owners: OwnerKey[]): UserOperation =>
-  wasm.signUserOperation(op, chainId, assertion, owners)
+export const signUserOperation = (
+  op: UserOperation,
+  chainId: number,
+  assertion: Assertion,
+  owners: OwnerKey[],
+  initialOwners: Hex[],
+): UserOperation => wasm.signUserOperation(op, chainId, assertion, owners, initialOwners)
 
 // Messages
 export const messageChallenge = (message: string, account: Address, chainId: number): MessageChallenge =>

@@ -5,8 +5,8 @@
 //! signature, so the full signing path is exercised against the real Coinbase Smart Wallet without a transaction.
 
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-use p256_wallet_core::api;
 use p256_wallet_core::records::{Assertion, GasEstimate, GasPrice, OwnerKey, PublicKey, UserOperation};
+use p256_wallet_core::{api, smart_wallet, webauthn};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -72,7 +72,13 @@ impl Key {
     }
 
     fn owner(&self, index: u32) -> OwnerKey {
-        OwnerKey { credential_id: self.credential_id(), owner_index: index, public_key: self.public_key() }
+        OwnerKey {
+            credential_id: self.credential_id(),
+            owner_index: index,
+            public_key: self.public_key(),
+            rp_id: "p256wallet.dev".into(),
+            require_user_verification: false,
+        }
     }
 
     fn assert(&self, challenge_hex: &str) -> Assertion {
@@ -255,20 +261,35 @@ fn account_accepts_signatures_from_each_owner_and_rejects_others() {
     let hash = api::review_user_operation(op.clone(), CHAIN_ID, vec![], vec![]).unwrap().hash;
 
     for key in [&primary, &backup] {
-        let signed = api::sign_user_operation(op.clone(), CHAIN_ID, key.assert(&hash), owners.clone()).unwrap();
+        let signed =
+            api::sign_user_operation(op.clone(), CHAIN_ID, key.assert(&hash), owners.clone(), account.owners.clone())
+                .unwrap();
         assert!(!sig_failed(&signed), "the account rejected a valid signature");
     }
 
-    // The core refuses a non-owner outright. Forge the wrapper anyway (claiming owner 0) to check the contract
-    // rejects it too.
-    assert!(api::sign_user_operation(op.clone(), CHAIN_ID, stranger.assert(&hash), owners).is_err());
-    let forged = api::sign_user_operation(
-        op.clone(),
-        CHAIN_ID,
-        stranger.assert(&hash),
-        vec![OwnerKey { owner_index: 0, ..stranger.owner(0) }],
-    )
-    .unwrap();
+    // The core refuses a non-owner outright, including one claiming an owner's index. Forge the wrapper from the
+    // lower-level pieces anyway (claiming owner 0) to check the contract rejects it too.
+    assert!(
+        api::sign_user_operation(op.clone(), CHAIN_ID, stranger.assert(&hash), owners, account.owners.clone()).is_err()
+    );
+    let claimed = vec![OwnerKey { owner_index: 0, ..stranger.owner(0) }];
+    assert!(api::sign_user_operation(op.clone(), CHAIN_ID, stranger.assert(&hash), claimed, account.owners.clone())
+        .is_err());
+    let raw = stranger.assert(&hash);
+    let assertion = webauthn::Assertion {
+        credential_id: unhex(&raw.credential_id),
+        authenticator_data: unhex(&raw.authenticator_data),
+        client_data_json: unhex(&raw.client_data_json),
+        signature_der: unhex(&raw.signature),
+    };
+    let point = stranger.0.verifying_key().to_encoded_point(false);
+    let expected = webauthn::ExpectedKey {
+        public_key: webauthn::PublicKey::new((*point.x().unwrap()).into(), (*point.y().unwrap()).into()).unwrap(),
+        rp_id: "p256wallet.dev".into(),
+        require_user_verification: false,
+    };
+    let data = webauthn::signature_data(&assertion, &unhex(&hash), &expected).unwrap();
+    let forged = UserOperation { signature: hex(&smart_wallet::wrap_signature(0, data)), ..op.clone() };
     assert!(sig_failed(&forged), "the account accepted a signature from a key that isn't an owner");
 }
 

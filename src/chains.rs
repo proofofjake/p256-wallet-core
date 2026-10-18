@@ -21,6 +21,7 @@ pub fn all() -> Vec<ChainConfig> {
                 token("0x4200000000000000000000000000000000000006", "WETH", "Wrapped Ether", 18),
             ],
             verification_gas_buffer: 30_000,
+            known_paymasters: vec![],
         },
         ChainConfig {
             id: 8453,
@@ -36,6 +37,7 @@ pub fn all() -> Vec<ChainConfig> {
                 token("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", "cbBTC", "Coinbase Wrapped BTC", 8),
             ],
             verification_gas_buffer: 30_000,
+            known_paymasters: vec![],
         },
     ]
 }

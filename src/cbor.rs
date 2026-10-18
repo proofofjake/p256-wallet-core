@@ -109,6 +109,10 @@ fn item(data: &[u8], offset: &mut usize, depth: usize) -> Result<Value> {
             let mut pairs = Vec::with_capacity(count);
             for _ in 0..count {
                 let key = item(data, offset, depth + 1)?;
+                // CTAP2 requires canonical CBOR. Accepting duplicates would let two parsers disagree on a key.
+                if pairs.iter().any(|(existing, _)| *existing == key) {
+                    return Err(invalid("CBOR map has a duplicate key"));
+                }
                 let value = item(data, offset, depth + 1)?;
                 pairs.push((key, value));
             }
@@ -173,5 +177,6 @@ mod tests {
         assert!(decode(&[0x81; 64]).is_err()); // nesting
         assert!(decode(&[0x01, 0x02]).is_err()); // trailing bytes
         assert!(decode(&[]).is_err());
+        assert!(decode(&[0xa2, 0x01, 0x02, 0x01, 0x03]).is_err()); // {1: 2, 1: 3}
     }
 }

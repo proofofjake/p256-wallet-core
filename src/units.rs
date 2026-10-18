@@ -3,11 +3,26 @@
 use crate::error::{invalid, Result};
 use ruint::aliases::U256;
 
-/// Parses `"1.5"` with 18 decimals into `1500000000000000000`. Accepts `,` as the decimal separator. Fails on
-/// malformed input, more fractional digits than `decimals`, or overflow, so an amount is never silently rounded.
+/// Parses `"1.5"` with 18 decimals into `1500000000000000000`. Fails on malformed input, more fractional digits
+/// than `decimals`, or overflow, so an amount is never silently rounded.
+///
+/// A single `,` is accepted as a decimal separator (`"1,5"`), except where it reads as a thousands separator:
+/// `"1,000"` is refused rather than guessed, as are amounts with both `,` and `.` or several commas.
 pub fn parse(text: &str, decimals: u8) -> Result<U256> {
     let error = || invalid(format!("Invalid amount: {text}"));
-    let normalized = text.trim().replace(',', ".");
+    let trimmed = text.trim();
+    let commas = trimmed.matches(',').count();
+    if commas > 1 || (commas == 1 && trimmed.contains('.')) {
+        return Err(invalid(format!("Ambiguous amount {trimmed}: use a dot for decimals and no thousands separators")));
+    }
+    if let Some((_, after)) = trimmed.split_once(',') {
+        if after.len() == 3 && after.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid(format!(
+                "Ambiguous amount {trimmed}: use a dot for decimals and no thousands separators"
+            )));
+        }
+    }
+    let normalized = trimmed.replace(',', ".");
     let (whole, fraction) = match normalized.split_once('.') {
         Some((whole, fraction)) => (whole, fraction),
         None => (normalized.as_str(), ""),
@@ -91,6 +106,12 @@ mod tests {
         assert_eq!(parse("10", 0).unwrap(), U256::from(10));
         assert_eq!(parse("0", 18).unwrap(), U256::ZERO);
         assert_eq!(parse(" 2 ", 0).unwrap(), U256::from(2));
+        // A comma that reads as a thousands separator is refused, not guessed.
+        for ambiguous in ["1,000", "1,000.5", "1.000,5", "1,000,000", "12,345"] {
+            assert!(parse(ambiguous, 6).is_err(), "{ambiguous}");
+        }
+        assert_eq!(parse("1,50", 6).unwrap(), U256::from(1_500_000));
+        assert_eq!(parse("1,5000", 6).unwrap(), U256::from(1_500_000));
         for bad in ["0.0000001", "1.2.3", "abc", "", ".", "-1", "1e5", "1 000"] {
             assert!(parse(bad, 6).is_err(), "{bad}");
         }

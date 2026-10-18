@@ -94,12 +94,14 @@ pub fn is_erc1271_success(result: String) -> bool {
     api::is_erc1271_success(result)
 }
 
-#[wasm_bindgen(js_name = publicKeyFromAttestationObject)]
-pub fn public_key_from_attestation_object(
+#[wasm_bindgen(js_name = verifyRegistration)]
+pub fn verify_registration(
     attestation_object: String,
     credential_id: String,
+    rp_id: String,
+    require_user_verification: bool,
 ) -> Result<JsValue, JsError> {
-    to_js(api::public_key_from_attestation_object(attestation_object, credential_id))
+    to_js(api::verify_registration(attestation_object, credential_id, rp_id, require_user_verification))
 }
 
 #[wasm_bindgen(js_name = ownerBytes)]
@@ -183,12 +185,14 @@ pub fn sign_user_operation(
     chain_id: u32,
     assertion: JsValue,
     owners: JsValue,
+    initial_owners: Vec<String>,
 ) -> Result<JsValue, JsError> {
     to_js(api::sign_user_operation(
         from_js(op, "user operation")?,
         chain_id.into(),
         from_js(assertion, "assertion")?,
         from_js(owners, "owners")?,
+        initial_owners,
     ))
 }
 

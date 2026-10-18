@@ -30,6 +30,7 @@ pub const ERC6492_MAGIC_SUFFIX: [u8; 32] = [
 pub const EXECUTE: &str = "execute(address,uint256,bytes)";
 pub const EXECUTE_BATCH: &str = "executeBatch((address,uint256,bytes)[])";
 pub const ADD_OWNER_PUBLIC_KEY: &str = "addOwnerPublicKey(bytes32,bytes32)";
+pub const REMOVE_OWNER_AT_INDEX: &str = "removeOwnerAtIndex(uint256,bytes)";
 pub const CREATE_ACCOUNT: &str = "createAccount(bytes[],uint256)";
 
 /// One call the account makes.
@@ -164,6 +165,51 @@ pub fn add_owner_public_key_call(account: [u8; 20], key: &PublicKey) -> Call {
             &[Token::FixedBytes(key.x.to_vec()), Token::FixedBytes(key.y.to_vec())],
         ),
     }
+}
+
+/// What a call from the account to itself does. These are the only self-calls the core will sign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfCall {
+    /// A new P-256 owner.
+    AddOwnerPublicKey(PublicKey),
+    /// Removes the owner at `index`, which must currently be `owner` (the contract checks).
+    RemoveOwnerAtIndex { index: U256, owner: Vec<u8> },
+}
+
+/// Classifies a call the account makes to itself. Everything outside [`SelfCall`] is refused, because the account's
+/// own functions control who owns it: `addOwnerAddress` hands it to an Ethereum address, `upgradeToAndCall` swaps
+/// its code, and `removeLastOwner` leaves it with no way to sign.
+pub fn classify_self_call(data: &[u8]) -> Result<SelfCall> {
+    let selector: [u8; 4] = data.get(..4).and_then(|s| s.try_into().ok()).unwrap_or_default();
+    let args = Decoder::new(&data[4.min(data.len())..]);
+    if selector == abi::selector(ADD_OWNER_PUBLIC_KEY) && data.len() == 4 + 64 {
+        let key = PublicKey::new(args.word(0)?, args.word(32)?)
+            .map_err(|_| invalid("Refused: the new owner isn't a valid P-256 key"))?;
+        return Ok(SelfCall::AddOwnerPublicKey(key));
+    }
+    if selector == abi::selector(REMOVE_OWNER_AT_INDEX) {
+        let owner = args.bytes(32, 0)?;
+        if owner.len() != 32 && owner.len() != 64 {
+            return Err(invalid("Refused: owner to remove must be 32 or 64 bytes"));
+        }
+        return Ok(SelfCall::RemoveOwnerAtIndex { index: args.uint(0)?, owner });
+    }
+    let refused = |reason: &str| Err(invalid(format!("Refused: {reason}")));
+    if selector == abi::selector("addOwnerAddress(address)") {
+        return refused(
+            "this wallet only accepts security keys as owners; an Ethereum address owner could take it over",
+        );
+    }
+    if selector == abi::selector("upgradeToAndCall(address,bytes)") {
+        return refused("this would replace the wallet's contract code");
+    }
+    if selector == abi::selector("removeLastOwner(uint256,bytes)") {
+        return refused("removing the last owner leaves the wallet with no way to sign");
+    }
+    refused(&format!(
+        "this calls the wallet's own function {}, which can change who controls it",
+        crate::hex::encode(&selector)
+    ))
 }
 
 /// `abi.encode(SignatureWrapper(ownerIndex, signatureData))`, the format `UserOperation.signature` and
@@ -352,6 +398,28 @@ mod tests {
         let mut truncated = call_data(&[Call { target: [1; 20], value: U256::ZERO, data: vec![1; 40] }]).unwrap();
         truncated.truncate(100);
         assert!(decode_call_data(&truncated).is_err());
+    }
+
+    #[test]
+    fn self_calls() {
+        let key = crate::webauthn::tests::public_key(&crate::webauthn::tests::test_key(1));
+        let add = add_owner_public_key_call([0x44; 20], &key).data;
+        assert_eq!(classify_self_call(&add).unwrap(), SelfCall::AddOwnerPublicKey(key));
+        let remove = abi::encode_call(
+            REMOVE_OWNER_AT_INDEX,
+            &[Token::Uint(U256::from(2)), Token::Bytes(key.owner_bytes().to_vec())],
+        );
+        assert!(matches!(classify_self_call(&remove).unwrap(), SelfCall::RemoveOwnerAtIndex { .. }));
+        for refused in [
+            abi::encode_call("addOwnerAddress(address)", &[Token::Address([0xba; 20])]),
+            abi::encode_call("upgradeToAndCall(address,bytes)", &[Token::Address([0xba; 20]), Token::Bytes(vec![])]),
+            abi::encode_call("removeLastOwner(uint256,bytes)", &[Token::Uint(U256::ZERO), Token::Bytes(vec![0; 64])]),
+            abi::encode_call("someOtherFunction()", &[]),
+            abi::encode_call(ADD_OWNER_PUBLIC_KEY, &[Token::FixedBytes(vec![1; 32]), Token::FixedBytes(vec![2; 32])]),
+            vec![1, 2],
+        ] {
+            assert!(classify_self_call(&refused).is_err());
+        }
     }
 
     #[test]

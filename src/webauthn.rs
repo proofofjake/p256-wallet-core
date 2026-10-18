@@ -11,7 +11,14 @@ use ruint::aliases::U256;
 
 pub const FLAG_USER_PRESENT: u8 = 0x01;
 pub const FLAG_USER_VERIFIED: u8 = 0x04;
+/// Set by credentials that can be synced or backed up (iCloud Keychain, Google Password Manager, phone passkeys),
+/// never by hardware security keys.
+pub const FLAG_BACKUP_ELIGIBLE: u8 = 0x08;
 pub const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
+pub const FLAG_EXTENSION_DATA: u8 = 0x80;
+
+/// `credProtect` level 3: the authenticator itself refuses to use the credential without user verification (PIN).
+pub const CRED_PROTECT_UV_REQUIRED: i64 = 3;
 
 /// A P-256 public key that is a valid point on the curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +59,8 @@ pub struct AuthenticatorData {
     pub sign_count: u32,
     /// Present at registration: the new credential's ID and public key.
     pub attested: Option<(Vec<u8>, PublicKey)>,
+    /// Authenticator extension outputs, parsed at registration (e.g. `credProtect`).
+    pub extensions: Option<cbor::Value>,
 }
 
 impl AuthenticatorData {
@@ -64,7 +73,7 @@ impl AuthenticatorData {
         let flags = data[32];
         let sign_count = u32::from_be_bytes(data[33..37].try_into().expect("4 bytes"));
         if flags & FLAG_ATTESTED_CREDENTIAL_DATA == 0 {
-            return Ok(AuthenticatorData { rp_id_hash, flags, sign_count, attested: None });
+            return Ok(AuthenticatorData { rp_id_hash, flags, sign_count, attested: None, extensions: None });
         }
         // aaguid (16) | credentialIdLength (2) | credentialId | credentialPublicKey (COSE_Key)
         let rest = data.get(37 + 16..).ok_or_else(|| error("truncated"))?;
@@ -72,9 +81,17 @@ impl AuthenticatorData {
             u16::from_be_bytes(rest.get(..2).ok_or_else(|| error("truncated"))?.try_into().expect("2 bytes"));
         let rest = &rest[2..];
         let credential_id = rest.get(..id_length as usize).ok_or_else(|| error("truncated credential ID"))?.to_vec();
-        let (cose_key, _) = cbor::decode_prefix(&rest[id_length as usize..])?;
+        let rest = &rest[id_length as usize..];
+        let (cose_key, used) = cbor::decode_prefix(rest)?;
         let public_key = public_key_from_cose(&cose_key)?;
-        Ok(AuthenticatorData { rp_id_hash, flags, sign_count, attested: Some((credential_id, public_key)) })
+        // Extensions follow the key when the ED flag is set; otherwise nothing may follow it.
+        let rest = &rest[used..];
+        let extensions = match flags & FLAG_EXTENSION_DATA {
+            0 if rest.is_empty() => None,
+            0 => return Err(error("unexpected bytes after the public key")),
+            _ => Some(cbor::decode(rest)?),
+        };
+        Ok(AuthenticatorData { rp_id_hash, flags, sign_count, attested: Some((credential_id, public_key)), extensions })
     }
 }
 
@@ -99,20 +116,66 @@ pub fn public_key_from_cose(key: &cbor::Value) -> Result<PublicKey> {
     PublicKey::new(coordinate(-2)?, coordinate(-3)?)
 }
 
-/// Extracts the public key from a registration's attestation object, checking it belongs to `credential_id`.
-pub fn public_key_from_attestation_object(attestation_object: &[u8], credential_id: &[u8]) -> Result<PublicKey> {
+/// A newly registered credential, as checked by [`register`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    pub public_key: PublicKey,
+    /// The key verified its PIN (or biometric) while registering.
+    pub user_verified: bool,
+    /// The key reported `credProtect` level 3, so it will refuse to sign without its PIN regardless of what any app
+    /// asks for.
+    pub pin_enforced_by_key: bool,
+}
+
+/// Checks a registration response and extracts its public key. Refuses:
+/// - a response for another credential, or another relying party (`rp_id`);
+/// - a credential that can be synced or backed up (a passkey, not a hardware key);
+/// - a response without user verification when `require_user_verification` is set (the user chose a PIN).
+pub fn register(
+    attestation_object: &[u8],
+    credential_id: &[u8],
+    rp_id: &str,
+    require_user_verification: bool,
+) -> Result<Registration> {
     let object = cbor::decode(attestation_object)?;
     let auth_data = object
         .get_text("authData")
         .and_then(cbor::Value::as_bytes)
         .ok_or_else(|| invalid("Attestation object has no authenticator data"))?;
     let parsed = AuthenticatorData::parse(auth_data)?;
+    if parsed.rp_id_hash != sha256(rp_id.as_bytes()) {
+        return Err(invalid(format!("Registration is for a different relying party than {rp_id}")));
+    }
+    if parsed.flags & FLAG_USER_PRESENT == 0 {
+        return Err(invalid("Registration is missing user presence (touch the key)"));
+    }
+    if parsed.flags & FLAG_BACKUP_ELIGIBLE != 0 {
+        return Err(invalid(
+            "This is a synced passkey (iCloud, Google or a phone), not a hardware security key. Use a YubiKey.",
+        ));
+    }
+    let user_verified = parsed.flags & FLAG_USER_VERIFIED != 0;
+    if require_user_verification && !user_verified {
+        return Err(invalid(
+            "The key didn't verify a PIN. Set a FIDO2 PIN on it (for example with Yubico Authenticator) and try again.",
+        ));
+    }
     let (attested_id, public_key) =
         parsed.attested.ok_or_else(|| invalid("Attestation has no credential public key"))?;
     if attested_id != credential_id {
         return Err(invalid("Attestation is for a different credential"));
     }
-    Ok(public_key)
+    let cred_protect = parsed.extensions.as_ref().and_then(|e| e.get_text("credProtect")).and_then(cbor::Value::as_int);
+    Ok(Registration { public_key, user_verified, pin_enforced_by_key: cred_protect == Some(CRED_PROTECT_UV_REQUIRED) })
+}
+
+/// What an assertion must match: the owner's public key, the relying party it was registered under, and whether
+/// the owner chose to require a PIN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedKey {
+    pub public_key: PublicKey,
+    pub rp_id: String,
+    pub require_user_verification: bool,
 }
 
 /// An assertion as returned by the authenticator, all fields raw.
@@ -140,17 +203,24 @@ pub fn challenge_needle(challenge: &[u8]) -> String {
 
 const TYPE_NEEDLE: &str = "\"type\":\"webauthn.get\"";
 
-/// Checks `assertion` signs `challenge` with `public_key`, then returns `abi.encode(WebAuthnAuth)`:
+/// Checks `assertion` signs `challenge` with the expected key, then returns `abi.encode(WebAuthnAuth)`:
 /// `(bytes authenticatorData, string clientDataJSON, uint256 challengeIndex, uint256 typeIndex, uint256 r, uint256 s)`.
 ///
 /// Every check the onchain verifier makes is repeated here (user-present flag, challenge and type at their
 /// offsets, low-s, the P-256 signature), so a bad response fails with a clear message instead of an opaque
-/// onchain validation error.
-pub fn signature_data(assertion: &Assertion, challenge: &[u8], public_key: &PublicKey) -> Result<Vec<u8>> {
+/// onchain validation error. Two checks go further than the contract: the relying party must be the one the key
+/// was registered under, and a key registered with a PIN must have verified it.
+pub fn signature_data(assertion: &Assertion, challenge: &[u8], expected: &ExpectedKey) -> Result<Vec<u8>> {
     let auth = AuthenticatorData::parse(&assertion.authenticator_data)
         .map_err(|_| bad_assertion("Security key returned malformed authenticator data"))?;
     if auth.flags & FLAG_USER_PRESENT == 0 {
         return Err(bad_assertion("Security key response is missing user presence (touch the key)"));
+    }
+    if auth.rp_id_hash != sha256(expected.rp_id.as_bytes()) {
+        return Err(bad_assertion("Security key response is for a different site or app than this wallet"));
+    }
+    if expected.require_user_verification && auth.flags & FLAG_USER_VERIFIED == 0 {
+        return Err(bad_assertion("This key requires its PIN, but the response wasn't PIN-verified"));
     }
     let json = &assertion.client_data_json;
     let challenge_index = find(json, challenge_needle(challenge).as_bytes())
@@ -161,7 +231,8 @@ pub fn signature_data(assertion: &Assertion, challenge: &[u8], public_key: &Publ
     let signature = parse_signature(&assertion.signature_der)?;
     let mut message = assertion.authenticator_data.clone();
     message.extend_from_slice(&sha256(json));
-    public_key
+    expected
+        .public_key
         .verifying_key()?
         .verify(&message, &signature)
         .map_err(|_| bad_assertion("Signature doesn't match this key's registered public key"))?;
@@ -230,6 +301,11 @@ pub(crate) mod tests {
         SigningKey::from_bytes(&[seed; 32].into()).unwrap()
     }
 
+    /// What `assert_with` responses match: rpId `p256wallet.dev`, no PIN required.
+    pub fn expected(key: &SigningKey) -> ExpectedKey {
+        ExpectedKey { public_key: public_key(key), rp_id: "p256wallet.dev".into(), require_user_verification: false }
+    }
+
     fn cbor_header(major: u8, value: usize) -> Vec<u8> {
         match value {
             0..=23 => vec![major << 5 | value as u8],
@@ -255,6 +331,11 @@ pub(crate) mod tests {
     }
 
     fn attestation_object(key: &PublicKey, credential_id: &[u8], alg: i64) -> Vec<u8> {
+        attestation_with(key, credential_id, alg, FLAG_USER_PRESENT, &[])
+    }
+
+    /// `extensions` is the raw CBOR extension map; when present the ED flag is set.
+    fn attestation_with(key: &PublicKey, credential_id: &[u8], alg: i64, flags: u8, extensions: &[u8]) -> Vec<u8> {
         let cose = [
             cbor_header(5, 5),
             cbor_int(1),
@@ -270,11 +351,13 @@ pub(crate) mod tests {
         ]
         .concat();
         let mut auth_data = sha256(b"example.com").to_vec();
-        auth_data.extend_from_slice(&[FLAG_USER_PRESENT | FLAG_ATTESTED_CREDENTIAL_DATA, 0, 0, 0, 7]);
+        let ed = if extensions.is_empty() { 0 } else { FLAG_EXTENSION_DATA };
+        auth_data.extend_from_slice(&[flags | FLAG_ATTESTED_CREDENTIAL_DATA | ed, 0, 0, 0, 7]);
         auth_data.extend_from_slice(&[0xaa; 16]);
         auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
         auth_data.extend_from_slice(credential_id);
         auth_data.extend(cose);
+        auth_data.extend_from_slice(extensions);
         [
             cbor_header(5, 3),
             cbor_text("fmt"),
@@ -292,10 +375,50 @@ pub(crate) mod tests {
         let key = public_key(&test_key(1));
         let credential_id: Vec<u8> = (0..48).collect();
         let object = attestation_object(&key, &credential_id, -7);
-        assert_eq!(public_key_from_attestation_object(&object, &credential_id).unwrap(), key);
-        assert!(public_key_from_attestation_object(&object, &[1, 2, 3]).is_err());
-        assert!(public_key_from_attestation_object(&attestation_object(&key, &credential_id, -257), &credential_id)
-            .is_err());
+        let registration = register(&object, &credential_id, "example.com", false).unwrap();
+        assert_eq!(registration.public_key, key);
+        assert!(!registration.user_verified && !registration.pin_enforced_by_key);
+        assert!(register(&object, &[1, 2, 3], "example.com", false).is_err(), "other credential");
+        assert!(register(&object, &credential_id, "evil.example", false).is_err(), "other relying party");
+        let rsa = attestation_object(&key, &credential_id, -257);
+        assert!(register(&rsa, &credential_id, "example.com", false).is_err(), "not ES256");
+    }
+
+    #[test]
+    fn registration_policy() {
+        let key = public_key(&test_key(1));
+        let id = [9u8; 16];
+        // Synced passkeys (backup eligible) are refused.
+        let synced = attestation_with(&key, &id, -7, FLAG_USER_PRESENT | FLAG_BACKUP_ELIGIBLE | 0x10, &[]);
+        assert!(register(&synced, &id, "example.com", false).is_err());
+        // A PIN was asked for but not verified.
+        let touch_only = attestation_object(&key, &id, -7);
+        assert!(register(&touch_only, &id, "example.com", true).is_err());
+        // PIN verified, and the key enforces it itself (credProtect = 3).
+        let cred_protect = [cbor_header(5, 1), cbor_text("credProtect"), cbor_int(3)].concat();
+        let protected = attestation_with(&key, &id, -7, FLAG_USER_PRESENT | FLAG_USER_VERIFIED, &cred_protect);
+        let registration = register(&protected, &id, "example.com", true).unwrap();
+        assert!(registration.user_verified && registration.pin_enforced_by_key);
+        // credProtect 2 doesn't count as enforced.
+        let optional = [cbor_header(5, 1), cbor_text("credProtect"), cbor_int(2)].concat();
+        let lax = attestation_with(&key, &id, -7, FLAG_USER_PRESENT | FLAG_USER_VERIFIED, &optional);
+        assert!(!register(&lax, &id, "example.com", true).unwrap().pin_enforced_by_key);
+        // Bytes after the key without the ED flag are malformed.
+        let mut trailing = attestation_object(&key, &id, -7);
+        let object = cbor::decode(&trailing).unwrap();
+        let mut auth = object.get_text("authData").unwrap().as_bytes().unwrap().to_vec();
+        auth.push(0);
+        trailing = [
+            cbor_header(5, 3),
+            cbor_text("fmt"),
+            cbor_text("none"),
+            cbor_text("attStmt"),
+            cbor_header(5, 0),
+            cbor_text("authData"),
+            cbor_bytes(&auth),
+        ]
+        .concat();
+        assert!(register(&trailing, &id, "example.com", false).is_err());
     }
 
     #[test]
@@ -311,7 +434,7 @@ pub(crate) mod tests {
         let key = test_key(2);
         let challenge = [0x42u8; 32];
         let assertion = assert_with(&key, &challenge, FLAG_USER_PRESENT | FLAG_USER_VERIFIED);
-        let encoded = signature_data(&assertion, &challenge, &public_key(&key)).unwrap();
+        let encoded = signature_data(&assertion, &challenge, &expected(&key)).unwrap();
 
         let decoder = abi::Decoder::new(&encoded);
         let base = decoder.usize(0).unwrap();
@@ -350,18 +473,25 @@ pub(crate) mod tests {
         let key = test_key(4);
         let challenge = [7u8; 32];
         let good = assert_with(&key, &challenge, FLAG_USER_PRESENT);
-        let public_key = public_key(&key);
+        let owner = expected(&key);
+        assert!(signature_data(&good, &challenge, &owner).is_ok());
 
-        assert!(signature_data(&good, &[8u8; 32], &public_key).is_err(), "wrong challenge");
-        assert!(signature_data(&good, &challenge, &self::public_key(&test_key(5))).is_err(), "wrong key");
+        assert!(signature_data(&good, &[8u8; 32], &owner).is_err(), "wrong challenge");
+        assert!(signature_data(&good, &challenge, &expected(&test_key(5))).is_err(), "wrong key");
         let no_presence = assert_with(&key, &challenge, 0);
-        assert!(signature_data(&no_presence, &challenge, &public_key).is_err(), "no user presence");
+        assert!(signature_data(&no_presence, &challenge, &owner).is_err(), "no user presence");
         let mut tampered = good.clone();
         tampered.authenticator_data[36] ^= 1;
-        assert!(signature_data(&tampered, &challenge, &public_key).is_err(), "tampered authenticator data");
+        assert!(signature_data(&tampered, &challenge, &owner).is_err(), "tampered authenticator data");
         let mut bad_der = good.clone();
         bad_der.signature_der[0] = 0x31;
-        assert!(signature_data(&bad_der, &challenge, &public_key).is_err(), "bad DER");
+        assert!(signature_data(&bad_der, &challenge, &owner).is_err(), "bad DER");
+        let other_rp = ExpectedKey { rp_id: "evil.example".into(), ..owner.clone() };
+        assert!(signature_data(&good, &challenge, &other_rp).is_err(), "other relying party");
+        let with_pin = ExpectedKey { require_user_verification: true, ..owner };
+        assert!(signature_data(&good, &challenge, &with_pin).is_err(), "PIN required, touch only");
+        let verified = assert_with(&key, &challenge, FLAG_USER_PRESENT | FLAG_USER_VERIFIED);
+        assert!(signature_data(&verified, &challenge, &with_pin).is_ok(), "PIN required and verified");
     }
 
     #[test]
