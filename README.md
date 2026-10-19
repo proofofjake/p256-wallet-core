@@ -29,18 +29,18 @@ so every output can be checked against a fixed expected value.
 | Guarantee | Where |
 |---|---|
 | The wallet address is derived locally (CREATE2 over the factory's init code hash), so a lying RPC can't substitute an address the user doesn't control. | `smart_wallet::account_address` |
-| A security key response is used only if it signed **this** operation's hash (or this message's replay-safe hash), with the user-present flag set, for the relying party the key was registered under, and the P-256 signature verifies against a registered owner's public key. | `api::sign_user_operation`, `api::sign_message`, `webauthn::signature_data` |
-| A key registered with a PIN can't sign without user verification. Registration with a PIN requires the key to verify it, and reports whether the key enforces the PIN itself (`credProtect`). | `webauthn::register`, `webauthn::signature_data` |
+| A security key response is used only if it signed **this** operation's hash (or this message's replay-safe hash), with the user-present flag set, for the relying party the key was registered under, not from a page embedded in another site, and the P-256 signature verifies against a registered owner's public key. | `api::sign_user_operation`, `api::sign_message`, `webauthn::signature_data` |
+| A key registered with a PIN enforces it itself: registration requires the key to verify the PIN and to apply `credProtect` level 3. Signing also refuses its responses without user verification. | `webauthn::register`, `webauthn::signature_data` |
 | Only hardware keys become owners: synced passkeys (backup-eligible credentials) are refused at registration. | `webauthn::register` |
-| The app's owner keys must match the wallet record: an initial owner's index must hold that owner's key. | `api::wrapped_signature` |
+| The app's owner keys must match the wallet record: an initial owner's index must hold that owner's key, and a key added later signs only on the chain it was added on. | `policy::check_owner_key`, `policy::wrapped_signature` |
 | Signatures are normalized to low-s, which the account requires. | `webauthn::parse_signature` |
 | The hash is recomputed from the operation at signing time; the apps can't pass in a different hash. | `api::sign_user_operation` |
-| Only `execute` / `executeBatch` account calls are signed, and any deployment must create exactly `sender` from the Coinbase factory. Calls the wallet makes to itself are limited to adding or removing a P-256 owner; adding an address owner, upgrading the contract, removing the last owner and anything else are refused. | `api::check_operation`, `smart_wallet::classify_self_call` |
-| The review names the sending wallet and network and lists every call: ETH and token amounts (raw units for unknown tokens, never a guessed symbol), approvals (2^128 and up read as unlimited), owner changes with the full key, and function names marked unverified (shown only when one supplied signature matches the selector). | `review::describe` |
+| Only `execute` / `executeBatch` account calls are signed, and any deployment must create exactly `sender` from the Coinbase factory. The only call the wallet may make to itself adds the key the app just registered (`new_owner`), as the operation's only call. Adding any other key or an address owner, removing owners, upgrading the contract and anything else are refused, so whoever builds an operation can't take the wallet over. Review and signing apply this policy through the same function. | `policy::check_operation`, `smart_wallet::decode_self_call` |
+| The review names the sending wallet and network and lists every call: ETH and token amounts (raw units for unknown tokens, never a guessed symbol), approvals and allowance increases (2^128 and up read as unlimited), approvals of every item in an NFT collection, Permit2 approvals with their expiry, `transferFrom` / `safeTransferFrom` with the wallet marked, the new owner key, and function names marked unverified, in batch summaries too (shown only when one supplied signature matches the selector). | `review::decode_call`, `review::describe` |
 | The review names any paymaster. Only paymasters on the chain's reviewed list are called sponsors; any other is flagged as able to charge the wallet's tokens. | `review::describe`, `ChainConfig::known_paymasters` |
-| Review text can't fake lines or reorder characters: control, bidi and invisible characters are shown as escapes, and long values are cut. | `review::sanitize` |
-| A wallet record whose owners don't produce its address is rejected before anything is built or signed, and a record restored from a backup file is checked the same way (plus valid, unique keys) before an app accepts it. | `api::build_user_operation`, `api::sign_message`, `api::check_wallet_record` |
-| Registered public keys must be valid curve points, from the credential that was just created, under the expected relying party. Duplicate CBOR map keys are refused. | `webauthn::register`, `cbor` |
+| Review text can't fake lines, reorder characters or hide any: only letters, marks, numbers, punctuation, symbols and the ASCII space are shown as themselves (an allow-list generated from the Unicode Character Database); everything else is shown as an escape, and long values are cut. | `review::sanitize`, `unicode_table` |
+| A wallet record whose owners don't produce its address is rejected before anything is built or signed. A record restored from a backup file is checked the same way, plus valid keys with unique credential IDs and no two keys in one owner slot on one chain, before an app accepts it. | `policy::record_owners`, `policy::check_wallet_record` |
+| Registered public keys must be valid curve points, from the credential that was just created, under the expected relying party. CBOR arrays and maps are capped at 32 items, duplicate map keys are refused, and what the authenticator encodes must be canonical CTAP2 CBOR. | `webauthn::register`, `cbor` |
 | Amounts are parsed exactly (no rounding, overflow is an error, and an ambiguous comma like "1,000" is refused), and display formatting never rounds up. | `units` |
 
 ### What the apps are responsible for (the glue checklist)
@@ -53,13 +53,18 @@ The apps stay thin, but a few things can only happen there. Review each app agai
    core unmodified. For a key registered with a PIN, ask for user verification (`required`).
 3. **Submit the operation the core returned from `sign_user_operation`**, without changing any field.
 4. **Store the wallet record faithfully**: initial owners in order, and for each key its credential ID, owner index,
-   relying party ID and PIN choice, exactly as registered.
+   relying party ID, PIN choice and (for keys added later) the chain it was added on, exactly as registered.
 5. **Register through `verify_registration`** with the relying party the key is created under. If the user chooses
-   a PIN, request user verification and, where the platform supports it, `credProtect` level 3 so the key enforces
-   the PIN itself.
+   a PIN, request user verification and `credProtect` level 3 (`userVerificationRequired`); the core refuses keys
+   that don't apply it. A platform that can't request `credProtect` (iOS today) can't offer a PIN.
 6. **`function_signatures` must come from a trusted source**: what the user typed, or an ABI bundled with the app.
    Never fill them from a public selector database; selectors collide by construction.
-7. **Endpoints**: bundler and RPC URLs are untrusted. They can cause failed or slow transactions, but they can't
+7. **Pass `new_owner` only from the app's own add-key flow**, straight from the `verify_registration` that just
+   ran, and `None` everywhere else. Nothing from outside the app (a dapp request, a deep link) may choose it. When
+   the extension relays transactions for dapps, it must also reject any call whose target is the wallet itself
+   before it reaches the core.
+8. **Show `CoreError::Refused` as "the wallet won't sign this"**, not as a problem with the user's input.
+9. **Endpoints**: bundler and RPC URLs are untrusted. They can cause failed or slow transactions, but they can't
    make the key sign something other than what was reviewed. The paymaster is part of the operation, so the review
    names it. Fees the bundler suggests are shown as the maximum cost (`max_gas_cost`); apps may also warn when
    they look high against the network's base fee.
@@ -70,15 +75,17 @@ Read in this order. Counts are non-blank lines excluding tests.
 
 | File | Lines | What to check |
 |---|---|---|
-| `src/api.rs` | ~410 | The whole surface the apps call. Each function validates its inputs; the two `sign_*` functions recompute what's signed. |
-| `src/webauthn.rs` | ~250 | Attestation parsing, assertion checks, `WebAuthnAuth` encoding (offsets must match the onchain verifier's). |
-| `src/smart_wallet.rs` | ~300 | Constants (factory, EntryPoint, init code hash), address derivation, call encoding and decoding, replay-safe hash, ERC-6492. |
+| `src/api.rs` | ~290 | The whole surface the apps call. Each function validates its inputs; the two `sign_*` functions recompute what's signed. |
+| `src/policy.rs` | ~180 | Every rule that can refuse something: the operation policy (self-calls, paymaster, deployment) that review and signing share, owner-key and wallet-record checks, and finding the signing owner. |
+| `src/webauthn.rs` | ~280 | Attestation parsing, assertion checks, `WebAuthnAuth` encoding (offsets must match the onchain verifier's). |
+| `src/smart_wallet.rs` | ~250 | Constants (factory, EntryPoint, init code hash), address derivation, call encoding and decoding, the self-call decoder, replay-safe hash, ERC-6492. |
 | `src/user_operation.rs` | ~70 | `getUserOpHash`, max cost, gas headroom. |
-| `src/review.rs` | ~200 | What the user is shown, and how text is sanitized. |
+| `src/review.rs` | ~380 | What the user is shown: each call decoded into a `CallKind`, then rendered, and how text is sanitized. |
 | `src/abi.rs` | ~200 | ABI encoding, and strict decoding (dirty padding and out-of-range offsets are rejected). |
-| `src/cbor.rs` | ~135 | Minimal CBOR for attestation objects, with bounded nesting and allocation. |
-| `src/units.rs`, `src/function_call.rs`, `src/address.rs`, `src/hex.rs` | ~300 | Amount parsing and formatting, contract call encoding, EIP-55, hex. |
-| `src/records.rs`, `src/wasm.rs`, `src/chains.rs` | ~415 | Data types and the one-line-per-function TypeScript wrappers. No logic. |
+| `src/cbor.rs` | ~180 | Minimal CBOR for attestation objects: bounded nesting and size, canonical form for what the authenticator encodes. |
+| `src/units.rs`, `src/function_call.rs`, `src/address.rs`, `src/hex.rs` | ~330 | Amount parsing and formatting, contract call encoding, EIP-55, hex. |
+| `src/convert.rs`, `src/functions.rs`, `src/records.rs`, `src/wasm.rs`, `src/chains.rs`, `src/error.rs` | ~535 | Record conversions, function signatures, data types, the generated TypeScript wrappers and static chain data. No policy. |
+| `src/unicode_table.rs` | generated | The review's character allow-list. Check `scripts/unicode-table.py` instead, and regenerate to compare. |
 
 Cryptography isn't implemented here. It comes from RustCrypto: P-256 ECDSA (`p256` / `ecdsa`), SHA-256 (`sha2`)
 and Keccak-256 (`sha3`). 256-bit arithmetic comes from `ruint`.
@@ -111,14 +118,15 @@ after its build script.
 cargo test --release --test fuzz                                  # no exported function may panic (wasm aborts)
 FUZZ_ITERS=200000 cargo test --release --test fuzz                # long run; FUZZ_SEED to vary
 cargo test --test security                                        # attacks the core refuses
-cargo test --test security -- --ignored                           # open findings (fail until fixed)
+cargo test --test security -- --ignored                           # open findings, if any (fail until fixed)
 CORE_DIFFERENTIAL=1 cargo test --release --test differential -- --nocapture   # vs Foundry's cast
 ```
 
 - `tests/fuzz.rs`: seeded mutation fuzzing of every API function and parser, with no extra dependencies.
 - `tests/security.rs`:
   - `guarantee_*` tests are attacks that must stay refused.
-  - `finding_*` tests are the open review findings, `#[ignore]`d until fixed.
+  - `finding_*` tests are the review findings, one per finding. An open one is `#[ignore]`d until fixed; none
+    are open.
 - `tests/differential.rs`: `execute`/`executeBatch` encoding and decoding compared with alloy's codec, on random and
   mutated calldata.
 
@@ -135,8 +143,13 @@ The Swift build targets Apple Silicon (no x86_64 simulator slice).
 
 ## Releasing and auditing
 
-Security reviews and how each finding was resolved are in [ISSUES.md](ISSUES.md). Adding a sponsor to a chain's
-`known_paymasters` is a reviewed change like any other: it decides which paymasters the review calls free.
+Security reviews and how each finding was resolved are in [SECURITY.md](SECURITY.md); what's still open is in
+[ISSUES.md](ISSUES.md). Adding a sponsor to a chain's `known_paymasters` is a reviewed change like any other: it
+decides which paymasters the review calls free.
+
+`src/unicode_table.rs` is generated from the Unicode Character Database. To move to a new Unicode version, download
+`ucd/extracted/DerivedGeneralCategory.txt` and `ucd/DerivedCoreProperties.txt` from
+<https://www.unicode.org/Public/UCD/latest/> into one directory and run `scripts/unicode-table.py <directory>`.
 
 1. Change the core, run both test suites, and bump `version` in `Cargo.toml` (`core_version()` reports it).
 2. Review the diff since the last tag, then tag it: `git tag -s v0.x.y`.

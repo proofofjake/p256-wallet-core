@@ -82,8 +82,13 @@ record! {
         pub public_key: PublicKey,
         /// The WebAuthn relying party ID the key was registered under. Assertions for any other are refused.
         pub rp_id: String,
-        /// The owner chose to protect this key with its PIN; assertions without user verification are refused.
+        /// The key was registered with a PIN. Since v0.3.0 that means the key enforces the PIN itself (`credProtect`
+        /// level 3). Signing also refuses a response without user verification, as defence in depth, but this flag
+        /// alone can't protect a key: anyone who can edit the stored record can clear it.
         pub require_user_verification: bool,
+        /// For an owner added after the wallet was created, the chain it was added on: it's an owner there only.
+        /// `None` for the initial owners, which own the account on every chain.
+        pub added_on_chain_id: Option<u64>,
     }
 }
 
@@ -94,6 +99,7 @@ record! {
         /// The key verified its PIN (or biometric) while registering.
         pub user_verified: bool,
         /// The key itself will refuse to sign without its PIN (`credProtect` level 3), whatever an app asks for.
+        /// Always true when the registration required a PIN.
         pub pin_enforced_by_key: bool,
     }
 }

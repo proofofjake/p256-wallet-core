@@ -1,229 +1,119 @@
-//! TypeScript bindings: one wrapper per `api` function, converting records to and from plain JS objects
-//! (camelCase fields, same shapes as the Swift records). No logic lives here. Chain IDs are `u32` because
-//! wasm-bindgen maps `u64` parameters to `BigInt`.
+//! TypeScript bindings: one generated wrapper per `api` function. Every argument and result crosses as a plain JS
+//! value converted with serde (records as camelCase objects, the same shapes as the Swift records), so adding an API
+//! function means adding one line to `export!`. No logic lives here.
+//!
+//! Errors are thrown as a JS `Error` whose `kind` is `invalidInput`, `invalidAssertion` or `refused`, matching
+//! `CoreError`.
 
 use crate::api;
 use crate::error::CoreError;
-use crate::records::*;
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::prelude::*;
 
-fn error(error: CoreError) -> JsError {
-    JsError::new(&error.to_string())
-}
-
-fn to_js<T: Serialize>(value: crate::error::Result<T>) -> Result<JsValue, JsError> {
-    serde_wasm_bindgen::to_value(&value.map_err(error)?).map_err(|e| JsError::new(&e.to_string()))
-}
-
-fn from_js<T: DeserializeOwned>(value: JsValue, what: &str) -> Result<T, JsError> {
-    serde_wasm_bindgen::from_value(value).map_err(|e| JsError::new(&format!("Invalid {what}: {e}")))
-}
-
-fn string(value: crate::error::Result<String>) -> Result<String, JsError> {
-    value.map_err(error)
-}
-
-#[wasm_bindgen(js_name = coreVersion)]
-pub fn core_version() -> String {
-    api::core_version()
-}
-
 #[wasm_bindgen]
-pub fn chains() -> Result<JsValue, JsError> {
-    to_js(Ok(api::chains()))
+extern "C" {
+    /// JavaScript's `Error`, given a `kind` property.
+    #[wasm_bindgen(js_name = Error)]
+    type JsErrorWithKind;
+    #[wasm_bindgen(constructor, js_class = "Error")]
+    fn new(message: &str) -> JsErrorWithKind;
+    #[wasm_bindgen(method, setter = kind, js_class = "Error")]
+    fn set_kind(this: &JsErrorWithKind, kind: &str);
 }
 
-#[wasm_bindgen(js_name = entryPointAddress)]
-pub fn entry_point_address() -> String {
-    api::entry_point_address()
+fn error(kind: &str, message: &str) -> JsValue {
+    let error = JsErrorWithKind::new(message);
+    error.set_kind(kind);
+    error.into()
 }
 
-#[wasm_bindgen(js_name = factoryAddress)]
-pub fn factory_address() -> String {
-    api::factory_address()
+fn core_error(error: CoreError) -> JsValue {
+    let kind = match error {
+        CoreError::InvalidInput(_) => "invalidInput",
+        CoreError::InvalidAssertion(_) => "invalidAssertion",
+        CoreError::Refused(_) => "refused",
+    };
+    self::error(kind, &error.to_string())
 }
 
-#[wasm_bindgen(js_name = checksumAddress)]
-pub fn checksum_address(address: String) -> Result<String, JsError> {
-    string(api::checksum_address(address))
+fn from_js<T: DeserializeOwned>(value: JsValue, name: &str) -> Result<T, JsValue> {
+    serde_wasm_bindgen::from_value(value)
+        .map_err(|e| error("invalidInput", &format!("Invalid {}: {e}", name.replace('_', " "))))
 }
 
-#[wasm_bindgen(js_name = parseQuantity)]
-pub fn parse_quantity(text: String) -> Result<String, JsError> {
-    string(api::parse_quantity(text))
+/// What an `api` function returns: a `Result`, or a plain value for the few that can't fail.
+trait Output {
+    type Value: Serialize;
+    fn into_result(self) -> crate::Result<Self::Value>;
 }
 
-#[wasm_bindgen(js_name = compareQuantities)]
-pub fn compare_quantities(a: String, b: String) -> Result<i8, JsError> {
-    api::compare_quantities(a, b).map_err(error)
+impl<T: Serialize> Output for crate::Result<T> {
+    type Value = T;
+    fn into_result(self) -> crate::Result<T> {
+        self
+    }
 }
 
-#[wasm_bindgen(js_name = parseUnits)]
-pub fn parse_units(text: String, decimals: u8) -> Result<String, JsError> {
-    string(api::parse_units(text, decimals))
+macro_rules! infallible {
+    ($($type:ty),*) => {$(
+        impl Output for $type {
+            type Value = $type;
+            fn into_result(self) -> crate::Result<$type> {
+                Ok(self)
+            }
+        }
+    )*};
 }
 
-#[wasm_bindgen(js_name = formatUnits)]
-pub fn format_units(quantity: String, decimals: u8, max_fraction_digits: u8) -> Result<String, JsError> {
-    string(api::format_units(quantity, decimals, max_fraction_digits))
+infallible!(String, bool, Option<String>, Vec<crate::records::ChainConfig>);
+
+fn to_js(output: impl Output) -> Result<JsValue, JsValue> {
+    serde_wasm_bindgen::to_value(&output.into_result().map_err(core_error)?)
+        .map_err(|e| error("invalidInput", &e.to_string()))
 }
 
-#[wasm_bindgen(js_name = formatUnitsPlain)]
-pub fn format_units_plain(quantity: String, decimals: u8) -> Result<String, JsError> {
-    string(api::format_units_plain(quantity, decimals))
+macro_rules! export {
+    ($($js_name:ident => $name:ident($($argument:ident),*);)*) => {$(
+        #[wasm_bindgen(js_name = $js_name)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name($($argument: JsValue),*) -> Result<JsValue, JsValue> {
+            to_js(api::$name($(from_js($argument, stringify!($argument))?),*))
+        }
+    )*};
 }
 
-#[wasm_bindgen(js_name = encodeFunctionCall)]
-pub fn encode_function_call(signature: String, arguments: Vec<String>) -> Result<JsValue, JsError> {
-    to_js(api::encode_function_call(signature, arguments))
-}
+export! {
+    coreVersion => core_version();
+    chains => chains();
+    entryPointAddress => entry_point_address();
+    factoryAddress => factory_address();
 
-#[wasm_bindgen(js_name = abiDecode)]
-pub fn abi_decode(types: Vec<String>, data: String) -> Result<Vec<String>, JsError> {
-    api::abi_decode(types, data).map_err(error)
-}
+    checksumAddress => checksum_address(address);
+    parseQuantity => parse_quantity(text);
+    compareQuantities => compare_quantities(a, b);
+    parseUnits => parse_units(text, decimals);
+    formatUnits => format_units(quantity, decimals, max_fraction_digits);
+    formatUnitsPlain => format_units_plain(quantity, decimals);
+    encodeFunctionCall => encode_function_call(signature, arguments);
+    abiDecode => abi_decode(types, data);
+    decodeRevertReason => decode_revert_reason(data);
+    isErc1271Success => is_erc1271_success(result);
 
-#[wasm_bindgen(js_name = decodeRevertReason)]
-pub fn decode_revert_reason(data: String) -> Option<String> {
-    api::decode_revert_reason(data)
-}
+    verifyRegistration => verify_registration(attestation_object, credential_id, rp_id, require_user_verification);
+    ownerBytes => owner_bytes(public_key);
+    accountAddress => account_address(initial_owners);
+    checkWalletRecord => check_wallet_record(address, initial_owners, keys);
 
-#[wasm_bindgen(js_name = isErc1271Success)]
-pub fn is_erc1271_success(result: String) -> bool {
-    api::is_erc1271_success(result)
-}
+    transferCall => transfer_call(token, to, amount);
+    addOwnerCall => add_owner_call(account, public_key);
 
-#[wasm_bindgen(js_name = verifyRegistration)]
-pub fn verify_registration(
-    attestation_object: String,
-    credential_id: String,
-    rp_id: String,
-    require_user_verification: bool,
-) -> Result<JsValue, JsError> {
-    to_js(api::verify_registration(attestation_object, credential_id, rp_id, require_user_verification))
-}
+    buildUserOperation => build_user_operation(sender, nonce, deployed, initial_owners, calls, gas_price, signing_owner_index);
+    fallbackGasPrice => fallback_gas_price(base_fee_per_gas, max_priority_fee_per_gas);
+    applyGasEstimate => apply_gas_estimate(user_operation, estimate, verification_gas_buffer);
+    reviewUserOperation => review_user_operation(user_operation, chain_id, tokens, function_signatures, new_owner);
+    userOperationHash => user_operation_hash(user_operation, chain_id);
+    signUserOperation => sign_user_operation(user_operation, chain_id, assertion, owners, initial_owners, new_owner);
 
-#[wasm_bindgen(js_name = ownerBytes)]
-pub fn owner_bytes(key: JsValue) -> Result<String, JsError> {
-    string(api::owner_bytes(from_js::<PublicKey>(key, "public key")?))
-}
-
-#[wasm_bindgen(js_name = accountAddress)]
-pub fn account_address(initial_owners: Vec<String>) -> Result<String, JsError> {
-    string(api::account_address(initial_owners))
-}
-
-#[wasm_bindgen(js_name = checkWalletRecord)]
-pub fn check_wallet_record(address: String, initial_owners: Vec<String>, keys: JsValue) -> Result<String, JsError> {
-    string(api::check_wallet_record(address, initial_owners, from_js(keys, "keys")?))
-}
-
-#[wasm_bindgen(js_name = transferCall)]
-pub fn transfer_call(token: Option<String>, to: String, amount: String) -> Result<JsValue, JsError> {
-    to_js(api::transfer_call(token, to, amount))
-}
-
-#[wasm_bindgen(js_name = addOwnerCall)]
-pub fn add_owner_call(account: String, key: JsValue) -> Result<JsValue, JsError> {
-    to_js(api::add_owner_call(account, from_js(key, "public key")?))
-}
-
-#[wasm_bindgen(js_name = buildUserOperation)]
-pub fn build_user_operation(
-    sender: String,
-    nonce: String,
-    deployed: bool,
-    initial_owners: Vec<String>,
-    calls: JsValue,
-    gas_price: JsValue,
-    signing_owner_index: u32,
-) -> Result<JsValue, JsError> {
-    to_js(api::build_user_operation(
-        sender,
-        nonce,
-        deployed,
-        initial_owners,
-        from_js(calls, "calls")?,
-        from_js(gas_price, "gas price")?,
-        signing_owner_index,
-    ))
-}
-
-#[wasm_bindgen(js_name = fallbackGasPrice)]
-pub fn fallback_gas_price(base_fee_per_gas: String, max_priority_fee_per_gas: String) -> Result<JsValue, JsError> {
-    to_js(api::fallback_gas_price(base_fee_per_gas, max_priority_fee_per_gas))
-}
-
-#[wasm_bindgen(js_name = applyGasEstimate)]
-pub fn apply_gas_estimate(op: JsValue, estimate: JsValue, verification_gas_buffer: u32) -> Result<JsValue, JsError> {
-    to_js(api::apply_gas_estimate(
-        from_js(op, "user operation")?,
-        from_js(estimate, "gas estimate")?,
-        verification_gas_buffer.into(),
-    ))
-}
-
-#[wasm_bindgen(js_name = reviewUserOperation)]
-pub fn review_user_operation(
-    op: JsValue,
-    chain_id: u32,
-    tokens: JsValue,
-    function_signatures: Vec<String>,
-) -> Result<JsValue, JsError> {
-    to_js(api::review_user_operation(
-        from_js(op, "user operation")?,
-        chain_id.into(),
-        from_js(tokens, "tokens")?,
-        function_signatures,
-    ))
-}
-
-#[wasm_bindgen(js_name = userOperationHash)]
-pub fn user_operation_hash(op: JsValue, chain_id: u32) -> Result<String, JsError> {
-    string(api::user_operation_hash(from_js(op, "user operation")?, chain_id.into()))
-}
-
-#[wasm_bindgen(js_name = signUserOperation)]
-pub fn sign_user_operation(
-    op: JsValue,
-    chain_id: u32,
-    assertion: JsValue,
-    owners: JsValue,
-    initial_owners: Vec<String>,
-) -> Result<JsValue, JsError> {
-    to_js(api::sign_user_operation(
-        from_js(op, "user operation")?,
-        chain_id.into(),
-        from_js(assertion, "assertion")?,
-        from_js(owners, "owners")?,
-        initial_owners,
-    ))
-}
-
-#[wasm_bindgen(js_name = messageChallenge)]
-pub fn message_challenge(message: String, account: String, chain_id: u32) -> Result<JsValue, JsError> {
-    to_js(api::message_challenge(message, account, chain_id.into()))
-}
-
-#[wasm_bindgen(js_name = signMessage)]
-#[allow(clippy::too_many_arguments)]
-pub fn sign_message(
-    message: String,
-    account: String,
-    chain_id: u32,
-    assertion: JsValue,
-    owners: JsValue,
-    deployed: bool,
-    initial_owners: Vec<String>,
-) -> Result<JsValue, JsError> {
-    to_js(api::sign_message(
-        message,
-        account,
-        chain_id.into(),
-        from_js(assertion, "assertion")?,
-        from_js(owners, "owners")?,
-        deployed,
-        initial_owners,
-    ))
+    messageChallenge => message_challenge(message, account, chain_id);
+    signMessage => sign_message(message, account, chain_id, assertion, owners, deployed, initial_owners);
 }

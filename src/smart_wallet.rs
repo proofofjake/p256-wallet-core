@@ -4,21 +4,23 @@
 //! owners sign WebAuthn assertions, which the account verifies with the RIP-7212 precompile.
 
 use crate::abi::{self, Decoder, Token};
-use crate::error::{invalid, Result};
+use crate::error::{invalid, wont_sign, Result};
+use crate::functions::*;
 use crate::hash::keccak256;
-use crate::webauthn::PublicKey;
+use crate::hex::array;
+use crate::webauthn::{PublicKey, P256_HALF_N};
 use ruint::aliases::U256;
 
 /// `CoinbaseSmartWalletFactory`, deployed at the same address on Base, Base Sepolia and most L2s.
-pub const FACTORY: [u8; 20] = hex20("0ba5ed0c6aa8c49038f819e587e2633c4a9f428a");
+pub const FACTORY: [u8; 20] = array("0ba5ed0c6aa8c49038f819e587e2633c4a9f428a");
 /// ERC-4337 EntryPoint v0.6, the version Coinbase Smart Wallet v1 targets.
-pub const ENTRY_POINT_V06: [u8; 20] = hex20("5ff137d4b0fdcd49dca30c7cf57e578a026d2789");
+pub const ENTRY_POINT_V06: [u8; 20] = array("5ff137d4b0fdcd49dca30c7cf57e578a026d2789");
 /// `CoinbaseSmartWallet` implementation the factory clones. Documentation only: the address follows from
 /// `INIT_CODE_HASH`.
-pub const IMPLEMENTATION: [u8; 20] = hex20("000100abaad02f1cfc8bbe32bd5a564817339e72");
+pub const IMPLEMENTATION: [u8; 20] = array("000100abaad02f1cfc8bbe32bd5a564817339e72");
 /// `factory.initCodeHash()`: keccak of the ERC-1967 proxy creation code pointing at `IMPLEMENTATION`. Read from the
 /// factory on Base and Base Sepolia; the live integration test checks it is still current.
-pub const INIT_CODE_HASH: [u8; 32] = hex32("5153041b4b8e36c84ca233b2fb610f85b8831b5e56a365618f507f8784fe034e");
+pub const INIT_CODE_HASH: [u8; 32] = array("5153041b4b8e36c84ca233b2fb610f85b8831b5e56a365618f507f8784fe034e");
 /// Returned by `isValidSignature` when a signature is valid (ERC-1271).
 pub const ERC1271_MAGIC_VALUE: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 /// Suffix marking a signature from an account that isn't deployed yet (ERC-6492).
@@ -26,12 +28,6 @@ pub const ERC6492_MAGIC_SUFFIX: [u8; 32] = [
     0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, //
     0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92,
 ];
-
-pub const EXECUTE: &str = "execute(address,uint256,bytes)";
-pub const EXECUTE_BATCH: &str = "executeBatch((address,uint256,bytes)[])";
-pub const ADD_OWNER_PUBLIC_KEY: &str = "addOwnerPublicKey(bytes32,bytes32)";
-pub const REMOVE_OWNER_AT_INDEX: &str = "removeOwnerAtIndex(uint256,bytes)";
-pub const CREATE_ACCOUNT: &str = "createAccount(bytes[],uint256)";
 
 /// One call the account makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +66,7 @@ pub fn init_code(owners: &[Vec<u8>], nonce: U256) -> Vec<u8> {
 /// The inverse of [`init_code`]: the owners and nonce a deployment will create the account with. Fails unless it is
 /// a `createAccount` call on [`FACTORY`].
 pub fn decode_init_code(init_code: &[u8]) -> Result<(Vec<Vec<u8>>, U256)> {
-    let unknown = || invalid("Account deployment doesn't use the Coinbase Smart Wallet factory");
+    let unknown = || wont_sign("the account deployment doesn't use the Coinbase Smart Wallet factory.");
     if init_code.len() < 24 || init_code[..20] != FACTORY || init_code[20..24] != abi::selector(CREATE_ACCOUNT) {
         return Err(unknown());
     }
@@ -124,10 +120,11 @@ pub fn call_data(calls: &[Call]) -> Result<Vec<u8>> {
     }
 }
 
-/// The inverse of [`call_data`]: what the account will execute. Fails for anything other than `execute` or
-/// `executeBatch`, so the core never signs an account call it can't describe.
+/// The inverse of [`call_data`]: what the account will execute. Refuses anything other than `execute` or
+/// `executeBatch` (such as the cross-chain `executeWithoutChainIdValidation`), so the core never signs an account
+/// call it can't describe.
 pub fn decode_call_data(data: &[u8]) -> Result<Vec<Call>> {
-    let unknown = || invalid("Transaction calls an account function this wallet doesn't recognize");
+    let unknown = || wont_sign("it calls an account function this wallet doesn't recognize.");
     let selector = data.get(..4).ok_or_else(unknown)?;
     let args = Decoder::new(&data[4..]);
     if selector == abi::selector(EXECUTE) {
@@ -167,49 +164,30 @@ pub fn add_owner_public_key_call(account: [u8; 20], key: &PublicKey) -> Call {
     }
 }
 
-/// What a call from the account to itself does. These are the only self-calls the core will sign.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SelfCall {
-    /// A new P-256 owner.
-    AddOwnerPublicKey(PublicKey),
-    /// Removes the owner at `index`, which must currently be `owner` (the contract checks).
-    RemoveOwnerAtIndex { index: U256, owner: Vec<u8> },
-}
-
-/// Classifies a call the account makes to itself. Everything outside [`SelfCall`] is refused, because the account's
-/// own functions control who owns it: `addOwnerAddress` hands it to an Ethereum address, `upgradeToAndCall` swaps
-/// its code, and `removeLastOwner` leaves it with no way to sign.
-pub fn classify_self_call(data: &[u8]) -> Result<SelfCall> {
+/// Decodes a call the account makes to itself and returns the key it adds. `addOwnerPublicKey` is the only
+/// self-call the core signs, and `policy::check_operation` allows it only for the key the app just registered.
+/// Everything else is refused, because the account's own functions control who owns it: `addOwnerAddress` and
+/// `upgradeToAndCall` can hand it over, and `removeOwnerAtIndex` and `removeLastOwner` can lock the owner out.
+pub fn decode_self_call(data: &[u8]) -> Result<PublicKey> {
     let selector: [u8; 4] = data.get(..4).and_then(|s| s.try_into().ok()).unwrap_or_default();
-    let args = Decoder::new(&data[4.min(data.len())..]);
     if selector == abi::selector(ADD_OWNER_PUBLIC_KEY) && data.len() == 4 + 64 {
-        let key = PublicKey::new(args.word(0)?, args.word(32)?)
-            .map_err(|_| invalid("Refused: the new owner isn't a valid P-256 key"))?;
-        return Ok(SelfCall::AddOwnerPublicKey(key));
+        let args = Decoder::new(&data[4..]);
+        return PublicKey::new(args.word(0)?, args.word(32)?)
+            .map_err(|_| wont_sign("the new owner isn't a valid P-256 key."));
     }
-    if selector == abi::selector(REMOVE_OWNER_AT_INDEX) {
-        let owner = args.bytes(32, 0)?;
-        if owner.len() != 32 && owner.len() != 64 {
-            return Err(invalid("Refused: owner to remove must be 32 or 64 bytes"));
-        }
-        return Ok(SelfCall::RemoveOwnerAtIndex { index: args.uint(0)?, owner });
-    }
-    let refused = |reason: &str| Err(invalid(format!("Refused: {reason}")));
-    if selector == abi::selector("addOwnerAddress(address)") {
-        return refused(
-            "this wallet only accepts security keys as owners; an Ethereum address owner could take it over",
-        );
-    }
-    if selector == abi::selector("upgradeToAndCall(address,bytes)") {
-        return refused("this would replace the wallet's contract code");
-    }
-    if selector == abi::selector("removeLastOwner(uint256,bytes)") {
-        return refused("removing the last owner leaves the wallet with no way to sign");
-    }
-    refused(&format!(
-        "this calls the wallet's own function {}, which can change who controls it",
-        crate::hex::encode(&selector)
-    ))
+    let reason = if selector == abi::selector(ADD_OWNER_ADDRESS) {
+        "it adds an Ethereum address as an owner, which could take the wallet over.".to_string()
+    } else if selector == abi::selector(UPGRADE_TO_AND_CALL) {
+        "it would replace the wallet's contract code.".to_string()
+    } else if selector == abi::selector(REMOVE_OWNER_AT_INDEX) || selector == abi::selector(REMOVE_LAST_OWNER) {
+        "removing an owner could lock you out of the wallet, so this wallet never removes owners.".to_string()
+    } else {
+        format!(
+            "it calls the wallet's own function {}, which can change who controls it.",
+            crate::hex::encode(&selector)
+        )
+    };
+    Err(wont_sign(&reason))
 }
 
 /// `abi.encode(SignatureWrapper(ownerIndex, signatureData))`, the format `UserOperation.signature` and
@@ -234,15 +212,13 @@ pub fn dummy_signature(owner_index: u32) -> Vec<u8> {
     );
     let challenge_index = json.find("\"challenge\"").expect("present");
     let type_index = json.find("\"type\"").expect("present");
-    let half_n =
-        U256::from_str_radix("7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8", 16).expect("constant");
     let data = abi::encode(&[Token::Tuple(vec![
         Token::Bytes(authenticator_data),
         Token::String(json),
         Token::Uint(U256::from(challenge_index)),
         Token::Uint(U256::from(type_index)),
-        Token::Uint(half_n),
-        Token::Uint(half_n),
+        Token::Uint(P256_HALF_N),
+        Token::Uint(P256_HALF_N),
     ])]);
     wrap_signature(owner_index, data)
 }
@@ -286,36 +262,6 @@ pub fn personal_message_hash(message: &[u8]) -> [u8; 32] {
     let mut preimage = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
     preimage.extend_from_slice(message);
     keccak256(preimage)
-}
-
-const fn hex20(text: &str) -> [u8; 20] {
-    let mut out = [0u8; 20];
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < 20 {
-        out[i] = nibble(bytes[2 * i]) << 4 | nibble(bytes[2 * i + 1]);
-        i += 1;
-    }
-    out
-}
-
-const fn hex32(text: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < 32 {
-        out[i] = nibble(bytes[2 * i]) << 4 | nibble(bytes[2 * i + 1]);
-        i += 1;
-    }
-    out
-}
-
-const fn nibble(char: u8) -> u8 {
-    match char {
-        b'0'..=b'9' => char - b'0',
-        b'a'..=b'f' => char - b'a' + 10,
-        _ => panic!("constant must be lowercase hex"),
-    }
 }
 
 #[cfg(test)]
@@ -404,21 +350,20 @@ mod tests {
     fn self_calls() {
         let key = crate::webauthn::tests::public_key(&crate::webauthn::tests::test_key(1));
         let add = add_owner_public_key_call([0x44; 20], &key).data;
-        assert_eq!(classify_self_call(&add).unwrap(), SelfCall::AddOwnerPublicKey(key));
-        let remove = abi::encode_call(
-            REMOVE_OWNER_AT_INDEX,
-            &[Token::Uint(U256::from(2)), Token::Bytes(key.owner_bytes().to_vec())],
-        );
-        assert!(matches!(classify_self_call(&remove).unwrap(), SelfCall::RemoveOwnerAtIndex { .. }));
+        assert_eq!(decode_self_call(&add).unwrap(), key);
         for refused in [
             abi::encode_call("addOwnerAddress(address)", &[Token::Address([0xba; 20])]),
             abi::encode_call("upgradeToAndCall(address,bytes)", &[Token::Address([0xba; 20]), Token::Bytes(vec![])]),
+            abi::encode_call(
+                "removeOwnerAtIndex(uint256,bytes)",
+                &[Token::Uint(U256::from(2)), Token::Bytes(key.owner_bytes().to_vec())],
+            ),
             abi::encode_call("removeLastOwner(uint256,bytes)", &[Token::Uint(U256::ZERO), Token::Bytes(vec![0; 64])]),
             abi::encode_call("someOtherFunction()", &[]),
             abi::encode_call(ADD_OWNER_PUBLIC_KEY, &[Token::FixedBytes(vec![1; 32]), Token::FixedBytes(vec![2; 32])]),
             vec![1, 2],
         ] {
-            assert!(classify_self_call(&refused).is_err());
+            assert!(matches!(decode_self_call(&refused), Err(crate::CoreError::Refused(_))));
         }
     }
 

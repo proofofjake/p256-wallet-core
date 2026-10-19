@@ -2,8 +2,8 @@
  * The core for TypeScript: typed wrappers over the WebAssembly build (scripts/build-wasm.sh). Same functions and
  * record shapes as the Swift binding; src/api.rs documents what each one does. Call `initCore()` once first.
  *
- * Byte strings are `0x` hex, numbers are JSON-RPC hex quantities, and errors are thrown as `Error` with a message
- * written to be shown to the user.
+ * Byte strings are `0x` hex, numbers are JSON-RPC hex quantities, and errors are thrown as `CoreError`: an `Error`
+ * with a message written to be shown to the user, and a `kind`.
  */
 import init, * as wasm from './pkg/p256_wallet_core.js'
 import type { InitInput } from './pkg/p256_wallet_core.js'
@@ -12,6 +12,17 @@ export type Hex = `0x${string}`
 export type Address = Hex
 /** JSON-RPC hex quantity, e.g. `0x1a`. */
 export type Quantity = Hex
+
+/**
+ * What the core throws. `refused` means a well-formed request the wallet won't carry out (see `CoreError::Refused` in
+ * src/error.rs), as opposed to malformed input or an unusable security key response.
+ */
+export interface CoreError extends Error {
+  kind: 'invalidInput' | 'invalidAssertion' | 'refused'
+}
+
+export const isCoreError = (error: unknown): error is CoreError =>
+  error instanceof Error && typeof (error as Partial<CoreError>).kind === 'string'
 
 export interface PublicKey {
   x: Hex
@@ -65,15 +76,17 @@ export interface OwnerKey {
   publicKey: PublicKey
   /** The WebAuthn relying party ID the key was registered under. */
   rpId: string
-  /** The owner chose to protect this key with its PIN. */
+  /** The key was registered with a PIN, which it enforces itself (keys registered before core v0.3.0 may not). */
   requireUserVerification: boolean
+  /** For an owner added after the wallet was created, the chain it was added on. Null for the initial owners. */
+  addedOnChainId: number | null
 }
 
 /** A security key registration, checked by `verifyRegistration`. */
 export interface Registration {
   publicKey: PublicKey
   userVerified: boolean
-  /** The key itself refuses to sign without its PIN (`credProtect` level 3). */
+  /** The key itself refuses to sign without its PIN (`credProtect` level 3). Always true when a PIN was required. */
   pinEnforcedByKey: boolean
 }
 
@@ -202,20 +215,27 @@ export const fallbackGasPrice = (baseFeePerGas: Quantity, maxPriorityFeePerGas: 
   wasm.fallbackGasPrice(baseFeePerGas, maxPriorityFeePerGas)
 export const applyGasEstimate = (op: UserOperation, estimate: GasEstimate, verificationGasBuffer: number): UserOperation =>
   wasm.applyGasEstimate(op, estimate, verificationGasBuffer)
+/**
+ * `newOwner` is only for the app's own add-key flow: the public key `verifyRegistration` just returned, when `op` adds
+ * it as an owner. An operation that adds any other key is refused.
+ */
 export const reviewUserOperation = (
   op: UserOperation,
   chainId: number,
   tokens: Token[] = [],
   functionSignatures: string[] = [],
-): OperationReview => wasm.reviewUserOperation(op, chainId, tokens, functionSignatures)
+  newOwner?: PublicKey,
+): OperationReview => wasm.reviewUserOperation(op, chainId, tokens, functionSignatures, newOwner)
 export const userOperationHash = (op: UserOperation, chainId: number): Hex => wasm.userOperationHash(op, chainId) as Hex
+/** Pass the same `newOwner` as to `reviewUserOperation`. */
 export const signUserOperation = (
   op: UserOperation,
   chainId: number,
   assertion: Assertion,
   owners: OwnerKey[],
   initialOwners: Hex[],
-): UserOperation => wasm.signUserOperation(op, chainId, assertion, owners, initialOwners)
+  newOwner?: PublicKey,
+): UserOperation => wasm.signUserOperation(op, chainId, assertion, owners, initialOwners, newOwner)
 
 // Messages
 export const messageChallenge = (message: string, account: Address, chainId: number): MessageChallenge =>

@@ -51,6 +51,26 @@ pub fn quantity(value: U256) -> String {
     format!("{value:#x}")
 }
 
+/// `N` bytes from a lowercase hex literal without `0x`, at compile time, for constants such as contract addresses.
+pub const fn array<const N: usize>(text: &str) -> [u8; N] {
+    const fn digit(char: u8) -> u8 {
+        match char {
+            b'0'..=b'9' => char - b'0',
+            b'a'..=b'f' => char - b'a' + 10,
+            _ => panic!("constant must be lowercase hex"),
+        }
+    }
+    let bytes = text.as_bytes();
+    assert!(bytes.len() == 2 * N, "constant has the wrong length");
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = digit(bytes[2 * i]) << 4 | digit(bytes[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
 fn strip_prefix(text: &str) -> &str {
     text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).unwrap_or(text)
 }
