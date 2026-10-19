@@ -3,7 +3,7 @@
 
 use crate::abi::{self, Token};
 use crate::cbor;
-use crate::error::{bad_assertion, invalid, Result};
+use crate::error::{bad_assertion, invalid, refused, Result};
 use crate::hash::sha256;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
@@ -19,6 +19,10 @@ pub const FLAG_EXTENSION_DATA: u8 = 0x80;
 
 /// `credProtect` level 3: the authenticator itself refuses to use the credential without user verification (PIN).
 pub const CRED_PROTECT_UV_REQUIRED: i64 = 3;
+
+/// Half the P-256 group order. Coinbase Smart Wallet rejects signatures with `s` above it.
+pub const P256_HALF_N: U256 =
+    U256::from_limbs([0x79dc_e561_7e31_92a8, 0xde73_7d56_d38b_cf42, 0x7fff_ffff_ffff_ffff, 0x7fff_ffff_8000_0000]);
 
 /// A P-256 public key that is a valid point on the curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,14 +86,15 @@ impl AuthenticatorData {
         let rest = &rest[2..];
         let credential_id = rest.get(..id_length as usize).ok_or_else(|| error("truncated credential ID"))?.to_vec();
         let rest = &rest[id_length as usize..];
-        let (cose_key, used) = cbor::decode_prefix(rest)?;
+        // Both are encoded by the authenticator itself, so they must be canonical CTAP2 CBOR.
+        let (cose_key, used) = cbor::decode_prefix(rest, cbor::Form::Canonical)?;
         let public_key = public_key_from_cose(&cose_key)?;
         // Extensions follow the key when the ED flag is set; otherwise nothing may follow it.
         let rest = &rest[used..];
         let extensions = match flags & FLAG_EXTENSION_DATA {
             0 if rest.is_empty() => None,
             0 => return Err(error("unexpected bytes after the public key")),
-            _ => Some(cbor::decode(rest)?),
+            _ => Some(cbor::decode(rest, cbor::Form::Canonical)?),
         };
         Ok(AuthenticatorData { rp_id_hash, flags, sign_count, attested: Some((credential_id, public_key)), extensions })
     }
@@ -123,21 +128,24 @@ pub struct Registration {
     /// The key verified its PIN (or biometric) while registering.
     pub user_verified: bool,
     /// The key reported `credProtect` level 3, so it will refuse to sign without its PIN regardless of what any app
-    /// asks for.
+    /// asks for. Always true when the registration required a PIN.
     pub pin_enforced_by_key: bool,
 }
 
 /// Checks a registration response and extracts its public key. Refuses:
 /// - a response for another credential, or another relying party (`rp_id`);
 /// - a credential that can be synced or backed up (a passkey, not a hardware key);
-/// - a response without user verification when `require_user_verification` is set (the user chose a PIN).
+/// - when `require_user_verification` is set (the user chose a PIN), a response without user verification, or from a
+///   key that didn't apply `credProtect` level 3. A PIN only protects a key if the key enforces it: a flag the app
+///   stores can be cleared by anyone who can edit the app's storage or a backup file.
 pub fn register(
     attestation_object: &[u8],
     credential_id: &[u8],
     rp_id: &str,
     require_user_verification: bool,
 ) -> Result<Registration> {
-    let object = cbor::decode(attestation_object)?;
+    // Assembled by the browser or OS, not the authenticator, so it isn't required to be canonical.
+    let object = cbor::decode(attestation_object, cbor::Form::Relaxed)?;
     let auth_data = object
         .get_text("authData")
         .and_then(cbor::Value::as_bytes)
@@ -150,14 +158,22 @@ pub fn register(
         return Err(invalid("Registration is missing user presence (touch the key)"));
     }
     if parsed.flags & FLAG_BACKUP_ELIGIBLE != 0 {
-        return Err(invalid(
+        return Err(refused(
             "This is a synced passkey (iCloud, Google or a phone), not a hardware security key. Use a YubiKey.",
         ));
     }
     let user_verified = parsed.flags & FLAG_USER_VERIFIED != 0;
+    let cred_protect = parsed.extensions.as_ref().and_then(|e| e.get_text("credProtect")).and_then(cbor::Value::as_int);
+    let pin_enforced_by_key = cred_protect == Some(CRED_PROTECT_UV_REQUIRED);
     if require_user_verification && !user_verified {
-        return Err(invalid(
+        return Err(refused(
             "The key didn't verify a PIN. Set a FIDO2 PIN on it (for example with Yubico Authenticator) and try again.",
+        ));
+    }
+    if require_user_verification && !pin_enforced_by_key {
+        return Err(refused(
+            "This key can't enforce a PIN by itself, so it can't be registered with one. YubiKey 5 keys with \
+             firmware 5.2 or later can; otherwise register it without a PIN.",
         ));
     }
     let (attested_id, public_key) =
@@ -165,12 +181,11 @@ pub fn register(
     if attested_id != credential_id {
         return Err(invalid("Attestation is for a different credential"));
     }
-    let cred_protect = parsed.extensions.as_ref().and_then(|e| e.get_text("credProtect")).and_then(cbor::Value::as_int);
-    Ok(Registration { public_key, user_verified, pin_enforced_by_key: cred_protect == Some(CRED_PROTECT_UV_REQUIRED) })
+    Ok(Registration { public_key, user_verified, pin_enforced_by_key })
 }
 
 /// What an assertion must match: the owner's public key, the relying party it was registered under, and whether
-/// the owner chose to require a PIN.
+/// the key was registered with a PIN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedKey {
     pub public_key: PublicKey,
@@ -208,8 +223,9 @@ const TYPE_NEEDLE: &str = "\"type\":\"webauthn.get\"";
 ///
 /// Every check the onchain verifier makes is repeated here (user-present flag, challenge and type at their
 /// offsets, low-s, the P-256 signature), so a bad response fails with a clear message instead of an opaque
-/// onchain validation error. Two checks go further than the contract: the relying party must be the one the key
-/// was registered under, and a key registered with a PIN must have verified it.
+/// onchain validation error. Some checks go further than the contract: the relying party must be the one the key
+/// was registered under, a key registered with a PIN must have verified it, the response can't come from a page
+/// embedded in another site (`crossOrigin`), and `type` and `challenge` must each appear once.
 pub fn signature_data(assertion: &Assertion, challenge: &[u8], expected: &ExpectedKey) -> Result<Vec<u8>> {
     let auth = AuthenticatorData::parse(&assertion.authenticator_data)
         .map_err(|_| bad_assertion("Security key returned malformed authenticator data"))?;
@@ -223,6 +239,13 @@ pub fn signature_data(assertion: &Assertion, challenge: &[u8], expected: &Expect
         return Err(bad_assertion("This key requires its PIN, but the response wasn't PIN-verified"));
     }
     let json = &assertion.client_data_json;
+    if json_value(json, "crossOrigin").is_some_and(|value| value.starts_with(b"true")) {
+        return Err(bad_assertion("Security key response came from a page embedded in another site"));
+    }
+    // A quote can't appear unescaped inside a JSON string, so each of these can only be a key (or a whole value).
+    if count(json, b"\"type\"") != 1 || count(json, b"\"challenge\"") != 1 {
+        return Err(bad_assertion("Security key response has a malformed clientDataJSON"));
+    }
     let challenge_index = find(json, challenge_needle(challenge).as_bytes())
         .ok_or_else(|| bad_assertion("Security key signed a different challenge than this request"))?;
     let type_index =
@@ -265,6 +288,17 @@ pub fn base64url(bytes: &[u8]) -> String {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack.windows(needle.len()).filter(|window| window == &needle).count()
+}
+
+/// The JSON after `"key"` and its colon, with surrounding whitespace skipped.
+fn json_value<'a>(json: &'a [u8], key: &str) -> Option<&'a [u8]> {
+    let at = find(json, format!("\"{key}\"").as_bytes())? + key.len() + 2;
+    let rest = json[at..].trim_ascii_start().strip_prefix(b":")?;
+    Some(rest.trim_ascii_start())
 }
 
 #[cfg(test)]
@@ -394,6 +428,10 @@ pub(crate) mod tests {
         // A PIN was asked for but not verified.
         let touch_only = attestation_object(&key, &id, -7);
         assert!(register(&touch_only, &id, "example.com", true).is_err());
+        // Verified, but the key didn't agree to enforce it.
+        let unenforced = attestation_with(&key, &id, -7, FLAG_USER_PRESENT | FLAG_USER_VERIFIED, &[]);
+        assert!(matches!(register(&unenforced, &id, "example.com", true), Err(crate::CoreError::Refused(_))));
+        assert!(register(&unenforced, &id, "example.com", false).unwrap().user_verified);
         // PIN verified, and the key enforces it itself (credProtect = 3).
         let cred_protect = [cbor_header(5, 1), cbor_text("credProtect"), cbor_int(3)].concat();
         let protected = attestation_with(&key, &id, -7, FLAG_USER_PRESENT | FLAG_USER_VERIFIED, &cred_protect);
@@ -402,10 +440,11 @@ pub(crate) mod tests {
         // credProtect 2 doesn't count as enforced.
         let optional = [cbor_header(5, 1), cbor_text("credProtect"), cbor_int(2)].concat();
         let lax = attestation_with(&key, &id, -7, FLAG_USER_PRESENT | FLAG_USER_VERIFIED, &optional);
-        assert!(!register(&lax, &id, "example.com", true).unwrap().pin_enforced_by_key);
+        assert!(register(&lax, &id, "example.com", true).is_err());
+        assert!(!register(&lax, &id, "example.com", false).unwrap().pin_enforced_by_key);
         // Bytes after the key without the ED flag are malformed.
         let mut trailing = attestation_object(&key, &id, -7);
-        let object = cbor::decode(&trailing).unwrap();
+        let object = cbor::decode(&trailing, cbor::Form::Relaxed).unwrap();
         let mut auth = object.get_text("authData").unwrap().as_bytes().unwrap().to_vec();
         auth.push(0);
         trailing = [
@@ -445,15 +484,16 @@ pub(crate) mod tests {
         let needle = challenge_needle(&challenge);
         assert_eq!(&json[challenge_index..challenge_index + needle.len()], needle.as_bytes());
         assert_eq!(&json[type_index..type_index + TYPE_NEEDLE.len()], TYPE_NEEDLE.as_bytes());
-        let half_n =
-            U256::from_str_radix("7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8", 16).unwrap();
-        assert!(s <= half_n);
+        assert!(s <= P256_HALF_N);
     }
 
     #[test]
     fn normalizes_high_s() {
-        let half_n =
-            U256::from_str_radix("7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8", 16).unwrap();
+        let half_n = P256_HALF_N;
+        assert_eq!(
+            half_n,
+            U256::from_str_radix("7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8", 16).unwrap()
+        );
         let key = test_key(3);
         let mut saw_high_s = false;
         for i in 0..64u8 {
@@ -492,6 +532,34 @@ pub(crate) mod tests {
         assert!(signature_data(&good, &challenge, &with_pin).is_err(), "PIN required, touch only");
         let verified = assert_with(&key, &challenge, FLAG_USER_PRESENT | FLAG_USER_VERIFIED);
         assert!(signature_data(&verified, &challenge, &with_pin).is_ok(), "PIN required and verified");
+    }
+
+    #[test]
+    fn client_data_must_be_same_origin_and_unambiguous() {
+        let key = test_key(4);
+        let challenge = [7u8; 32];
+        let owner = expected(&key);
+        let sign = |json: String| {
+            let mut assertion = assert_with(&key, &challenge, FLAG_USER_PRESENT);
+            assertion.client_data_json = json.into_bytes();
+            let mut message = assertion.authenticator_data.clone();
+            message.extend_from_slice(&sha256(&assertion.client_data_json));
+            let signature: Signature = key.sign(&message);
+            assertion.signature_der = signature.to_der().as_bytes().to_vec();
+            assertion
+        };
+        let needle = challenge_needle(&challenge);
+        let origin = "\"origin\":\"https://p256wallet.dev\"";
+        let ok = sign(format!("{{{TYPE_NEEDLE},{needle},{origin},\"crossOrigin\":false}}"));
+        assert!(signature_data(&ok, &challenge, &owner).is_ok());
+        for refused in [
+            format!("{{{TYPE_NEEDLE},{needle},{origin},\"crossOrigin\":true}}"),
+            format!("{{{TYPE_NEEDLE},{needle},{origin},\"crossOrigin\" : true}}"),
+            format!("{{{TYPE_NEEDLE},{needle},{origin},{TYPE_NEEDLE}}}"),
+            format!("{{{TYPE_NEEDLE},{needle},{origin},\"challenge\":\"AAAA\"}}"),
+        ] {
+            assert!(signature_data(&sign(refused.clone()), &challenge, &owner).is_err(), "{refused}");
+        }
     }
 
     #[test]

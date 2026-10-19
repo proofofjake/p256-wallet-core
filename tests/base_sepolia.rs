@@ -78,6 +78,7 @@ impl Key {
             public_key: self.public_key(),
             rp_id: "p256wallet.dev".into(),
             require_user_verification: false,
+            added_on_chain_id: None,
         }
     }
 
@@ -258,23 +259,42 @@ fn account_accepts_signatures_from_each_owner_and_rejects_others() {
     let account = account(&[&primary, &backup]);
     let owners = vec![primary.owner(0), backup.owner(1)];
     let op = first_operation(&account);
-    let hash = api::review_user_operation(op.clone(), CHAIN_ID, vec![], vec![]).unwrap().hash;
+    let hash = api::review_user_operation(op.clone(), CHAIN_ID, vec![], vec![], None).unwrap().hash;
 
     for key in [&primary, &backup] {
-        let signed =
-            api::sign_user_operation(op.clone(), CHAIN_ID, key.assert(&hash), owners.clone(), account.owners.clone())
-                .unwrap();
+        let signed = api::sign_user_operation(
+            op.clone(),
+            CHAIN_ID,
+            key.assert(&hash),
+            owners.clone(),
+            account.owners.clone(),
+            None,
+        )
+        .unwrap();
         assert!(!sig_failed(&signed), "the account rejected a valid signature");
     }
 
     // The core refuses a non-owner outright, including one claiming an owner's index. Forge the wrapper from the
     // lower-level pieces anyway (claiming owner 0) to check the contract rejects it too.
-    assert!(
-        api::sign_user_operation(op.clone(), CHAIN_ID, stranger.assert(&hash), owners, account.owners.clone()).is_err()
-    );
+    assert!(api::sign_user_operation(
+        op.clone(),
+        CHAIN_ID,
+        stranger.assert(&hash),
+        owners,
+        account.owners.clone(),
+        None
+    )
+    .is_err());
     let claimed = vec![OwnerKey { owner_index: 0, ..stranger.owner(0) }];
-    assert!(api::sign_user_operation(op.clone(), CHAIN_ID, stranger.assert(&hash), claimed, account.owners.clone())
-        .is_err());
+    assert!(api::sign_user_operation(
+        op.clone(),
+        CHAIN_ID,
+        stranger.assert(&hash),
+        claimed,
+        account.owners.clone(),
+        None
+    )
+    .is_err());
     let raw = stranger.assert(&hash);
     let assertion = webauthn::Assertion {
         credential_id: unhex(&raw.credential_id),

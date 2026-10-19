@@ -91,6 +91,7 @@ impl Wallet {
                 public_key: key.public_key(),
                 rp_id: RP_ID.into(),
                 require_user_verification: false,
+                added_on_chain_id: None,
             })
             .collect();
         let address = api::account_address(owners.clone()).unwrap();
@@ -127,9 +128,9 @@ impl Wallet {
 
     /// Reviews `op`, has key `index` sign the reviewed hash, and attaches the signature.
     pub fn sign(&self, op: &UserOperation, index: usize) -> Result<UserOperation, p256_wallet_core::CoreError> {
-        let review = api::review_user_operation(op.clone(), CHAIN, vec![], vec![])?;
+        let review = api::review_user_operation(op.clone(), CHAIN, vec![], vec![], None)?;
         let assertion = self.keys[index].assert(&hex::decode(&review.hash).unwrap(), FLAG_UP);
-        api::sign_user_operation(op.clone(), CHAIN, assertion, self.owner_keys.clone(), self.owners.clone())
+        api::sign_user_operation(op.clone(), CHAIN, assertion, self.owner_keys.clone(), self.owners.clone(), None)
     }
 }
 
@@ -272,12 +273,19 @@ pub fn cose_key(x: &[u8], y: &[u8], extra: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 
 /// A `fmt: none` attestation object for `cose`, with the given authenticator flags (AT is added).
 pub fn attestation_object(cose: &[u8], credential_id: &[u8], flags: u8) -> Vec<u8> {
+    attestation_with_extensions(cose, credential_id, flags, &[])
+}
+
+/// As `attestation_object`, with `extensions` (a CBOR map) after the key and the ED flag set when there are any.
+pub fn attestation_with_extensions(cose: &[u8], credential_id: &[u8], flags: u8, extensions: &[u8]) -> Vec<u8> {
     let mut auth_data = sha256(b"p256wallet.dev").to_vec();
-    auth_data.extend_from_slice(&[flags | 0x40, 0, 0, 0, 0]);
+    let ed = if extensions.is_empty() { 0 } else { 0x80 };
+    auth_data.extend_from_slice(&[flags | 0x40 | ed, 0, 0, 0, 0]);
     auth_data.extend_from_slice(&[0xaa; 16]);
     auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
     auth_data.extend_from_slice(credential_id);
     auth_data.extend_from_slice(cose);
+    auth_data.extend_from_slice(extensions);
     cbor_map(&[
         (cbor_text("fmt"), cbor_text("none")),
         (cbor_text("attStmt"), cbor_map(&[])),
@@ -287,7 +295,17 @@ pub fn attestation_object(cose: &[u8], credential_id: &[u8], flags: u8) -> Vec<u
 
 impl Key {
     pub fn attestation(&self, flags: u8) -> Vec<u8> {
+        self.attestation_with_extensions(flags, &[])
+    }
+
+    /// With the `credProtect` extension output a key gives when it agreed to enforce its PIN (level 3).
+    pub fn attestation_with_pin_enforced(&self, flags: u8) -> Vec<u8> {
+        self.attestation_with_extensions(flags, &cbor_map(&[(cbor_text("credProtect"), cbor_int(3))]))
+    }
+
+    pub fn attestation_with_extensions(&self, flags: u8, extensions: &[u8]) -> Vec<u8> {
         let point = self.signing.verifying_key().to_encoded_point(false);
-        attestation_object(&cose_key(point.x().unwrap(), point.y().unwrap(), &[]), &self.credential_id, flags)
+        let cose = cose_key(point.x().unwrap(), point.y().unwrap(), &[]);
+        attestation_with_extensions(&cose, &self.credential_id, flags, extensions)
     }
 }

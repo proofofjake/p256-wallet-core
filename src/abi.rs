@@ -217,9 +217,9 @@ pub fn decode_values(types: &[String], data: &[u8]) -> Result<Vec<String>> {
 pub fn decode_revert_reason(data: &[u8]) -> Option<String> {
     let (selector_bytes, payload) = (data.get(..4)?, data.get(4..)?);
     let decoder = Decoder::new(payload);
-    if selector_bytes == selector("Error(string)") {
+    if selector_bytes == selector(crate::functions::ERROR) {
         decoder.string(0, 0).ok()
-    } else if selector_bytes == selector("Panic(uint256)") {
+    } else if selector_bytes == selector(crate::functions::PANIC) {
         let code = decoder.uint(0).ok()?;
         Some(format!("Panic {}", crate::hex::quantity(code)))
     } else {

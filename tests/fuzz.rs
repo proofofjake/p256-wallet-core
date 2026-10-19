@@ -12,8 +12,9 @@
 mod common;
 
 use common::*;
+use p256_wallet_core::abi::Token as Abi;
 use p256_wallet_core::records::{GasEstimate, OwnerKey, Token};
-use p256_wallet_core::{abi, api, cbor, hex, smart_wallet};
+use p256_wallet_core::{abi, api, cbor, functions, hex, smart_wallet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 fn iterations() -> usize {
@@ -86,10 +87,41 @@ fn seed_calldata() -> Vec<Vec<u8>> {
         .to_vec(),
     )
     .unwrap();
+    let (wallet_address, dead) = (Abi::Address([0xaa; 20]), Abi::Address([0xde; 20]));
+    let token_calls = [
+        abi::encode_call(functions::SET_APPROVAL_FOR_ALL, &[dead.clone(), Abi::Bool(true)]),
+        abi::encode_call(functions::INCREASE_ALLOWANCE, &[dead.clone(), Abi::Uint(ruint::aliases::U256::MAX)]),
+        abi::encode_call(
+            functions::PERMIT2_APPROVE,
+            &[
+                dead.clone(),
+                dead.clone(),
+                Abi::Uint(ruint::aliases::U256::from(5)),
+                Abi::Uint(ruint::aliases::U256::from(9)),
+            ],
+        ),
+        abi::encode_call(
+            functions::SAFE_TRANSFER_FROM_WITH_DATA,
+            &[wallet_address.clone(), dead.clone(), Abi::Uint(ruint::aliases::U256::from(1)), Abi::Bytes(vec![7; 33])],
+        ),
+        abi::encode_call(
+            functions::SAFE_TRANSFER_FROM_ERC1155,
+            &[
+                wallet_address,
+                dead,
+                Abi::Uint(ruint::aliases::U256::from(1)),
+                Abi::Uint(ruint::aliases::U256::from(2)),
+                Abi::Bytes(vec![]),
+            ],
+        ),
+    ];
+    let token_batch = token_calls.iter().map(|data| raw_call(DEAD, "0x0", data)).collect();
     [
         wallet.op(vec![eth.clone()], true),
         wallet.op(vec![eth, token.clone(), raw_call(DEAD, "0x0", &hex::decode(&mint.data).unwrap())], true),
         wallet.op(vec![token], false),
+        wallet.op(token_batch, true),
+        wallet.op(vec![api::add_owner_call(wallet.address.clone(), Key::from_seed(9).public_key()).unwrap()], true),
     ]
     .iter()
     .map(|op| hex::decode(&op.call_data).unwrap())
@@ -102,6 +134,7 @@ fn review_never_panics_on_mutated_call_data() {
     let wallet = Wallet::new(&[1]);
     let base = wallet.op(vec![api::transfer_call(None, DEAD.into(), "0x1".into()).unwrap()], true);
     let signatures: Vec<String> = SIGNATURES.iter().map(|s| s.to_string()).collect();
+    let new_owner = Key::from_seed(9).public_key();
     fuzz("review", |rng| {
         let mut op = base.clone();
         let seed = rng.pick(&seeds).clone();
@@ -109,7 +142,8 @@ fn review_never_panics_on_mutated_call_data() {
         if rng.chance(4) {
             op.paymaster_and_data = hex::encode(&rng.bytes_upto(60));
         }
-        if let Ok(review) = api::review_user_operation(op.clone(), CHAIN, token_list(), signatures.clone()) {
+        let new_owner = rng.chance(2).then(|| new_owner.clone());
+        if let Ok(review) = api::review_user_operation(op.clone(), CHAIN, token_list(), signatures.clone(), new_owner) {
             // Whatever the core agreed to describe, it must also agree to sign (same check), and the hash it shows
             // must be the operation's hash.
             assert_eq!(review.hash, api::user_operation_hash(op, CHAIN).unwrap());
@@ -134,9 +168,14 @@ fn signing_never_panics_on_mutated_assertions() {
             _ => a.credential_id = mutate(&a.credential_id, rng),
         }
         let mutated = a != good;
-        if let Ok(signed) =
-            api::sign_user_operation(op.clone(), CHAIN, a.clone(), wallet.owner_keys.clone(), wallet.owners.clone())
-        {
+        if let Ok(signed) = api::sign_user_operation(
+            op.clone(),
+            CHAIN,
+            a.clone(),
+            wallet.owner_keys.clone(),
+            wallet.owners.clone(),
+            None,
+        ) {
             // A mutated response may only be accepted if the signature still verifies over what it covers, i.e. the
             // mutation hit bytes outside the signed message (credential ID is a lookup key, not signed).
             if mutated && field != 3 {
@@ -152,12 +191,13 @@ fn signing_never_panics_on_mutated_assertions() {
 #[test]
 fn attestation_parsing_never_panics() {
     let key = Key::from_seed(3);
-    let good = key.attestation(FLAG_UP);
+    let seeds = [key.attestation(FLAG_UP), key.attestation_with_pin_enforced(FLAG_UP | FLAG_UV)];
     fuzz("verify_registration", |rng| {
-        let data = rng.mutate(&good);
+        let seed = rng.pick(&seeds).clone();
+        let data = rng.mutate(&seed);
         let pin = rng.chance(2);
         let _ = api::verify_registration(hex::encode(&data), hex::encode(&key.credential_id), RP_ID.into(), pin);
-        let _ = cbor::decode(&data);
+        let _ = cbor::decode(&data, cbor::Form::Relaxed);
     });
 }
 
@@ -165,8 +205,10 @@ fn attestation_parsing_never_panics() {
 fn cbor_never_panics_on_random_bytes() {
     fuzz("cbor", |rng| {
         let data = rng.bytes_upto(80);
-        let _ = cbor::decode(&data);
-        let _ = cbor::decode_prefix(&data);
+        for form in [cbor::Form::Canonical, cbor::Form::Relaxed] {
+            let _ = cbor::decode(&data, form);
+            let _ = cbor::decode_prefix(&data, form);
+        }
     });
 }
 
@@ -180,7 +222,7 @@ fn init_code_decoding_never_panics() {
         let _ = smart_wallet::decode_init_code(&data);
         let mut changed = op.clone();
         changed.init_code = hex::encode(&data);
-        let _ = api::review_user_operation(changed, CHAIN, vec![], vec![]);
+        let _ = api::review_user_operation(changed, CHAIN, vec![], vec![], None);
     });
 }
 
@@ -311,11 +353,19 @@ fn gas_and_keys_never_panic() {
             public_key: key,
             rp_id: random_text(rng),
             require_user_verification: rng.chance(2),
+            added_on_chain_id: rng.chance(2).then(|| rng.next()),
         };
         let _ = api::check_wallet_record(random_text(rng), owners.clone(), vec![fake.clone()]);
         let _ = api::check_wallet_record(wallet.address.clone(), wallet.owners.clone(), vec![fake.clone()]);
         let assertion = wallet.keys[0].assert(&rng.bytes(32), rng.next() as u8);
-        let _ = api::sign_user_operation(op.clone(), rng.next(), assertion.clone(), vec![fake.clone()], owners.clone());
+        let _ = api::sign_user_operation(
+            op.clone(),
+            rng.next(),
+            assertion.clone(),
+            vec![fake.clone()],
+            owners.clone(),
+            None,
+        );
         let _ = api::sign_message(
             random_text(rng),
             wallet.address.clone(),

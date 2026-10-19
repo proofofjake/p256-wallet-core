@@ -16,7 +16,8 @@
 mod common;
 
 use common::Rng;
-use p256_wallet_core::smart_wallet::{call_data, decode_call_data, Call, EXECUTE, EXECUTE_BATCH};
+use p256_wallet_core::functions::{EXECUTE, EXECUTE_BATCH};
+use p256_wallet_core::smart_wallet::{call_data, decode_call_data, Call};
 use p256_wallet_core::{address, hex};
 use ruint::aliases::U256;
 use std::process::Command;
